@@ -989,16 +989,71 @@ Install jq manually and rerun \`swarm install\`."
   info "  ✓ jq installed ($(jq --version 2>/dev/null | head -1))"
 }
 
-ensure_gitignore_swarm_entry() {
-  local gi="$SWARM_ROOT/.gitignore"
-  if [[ -f "$gi" ]] && grep -qE '^\.swarm/?$' "$gi" 2>/dev/null; then
+write_default_swarm_md() {
+  # $1 = destination path. Caller decides create-vs-skip policy.
+  cat >"$1" <<'EOF'
+# Swarm Workspace Instructions
+
+Add workspace-specific instructions for agents here.
+
+Examples:
+
+- work-management or MCP tools agents should use
+- repository-specific development conventions
+- feature/specification documentation requirements
+- host-specific build and test constraints
+
+Do not duplicate machine configuration from `swarm.json` or universal Swarm behavior from the Swarm skill.
+EOF
+}
+
+ensure_swarm_md() {
+  local md="$SWARM_ROOT/swarm.md"
+  if [[ -f "$md" ]]; then
+    info "  ✓ swarm.md present"
     return 0
   fi
-  {
-    printf '\n# Swarm local runtime state\n'
-    printf '.swarm/\n'
-  } >>"$gi"
-  info "  ✓ appended .swarm/ to .gitignore"
+  if [[ -e "$md" ]]; then
+    die "error: $md exists but is not a regular file.
+Remove or resolve it manually, then rerun \`swarm install\`."
+  fi
+  write_default_swarm_md "$md"
+  info "  ✓ created swarm.md (was missing)"
+}
+
+ensure_gitignore_swarm_block() {
+  # Idempotent managed .gitignore block for worktrees + .swarm runtime state.
+  local gi="$SWARM_ROOT/.gitignore"
+  local desired
+  desired="$(cat <<'EOF'
+# Parallel agent worktrees: <repos_dir>/<repo>__<work-id>/ (see swarm.json)
+*__*/
+
+# Swarm local runtime state (submission inbox)
+.swarm/
+EOF
+)"
+
+  inspect_swarm_managed_block "$gi"
+  case "$_SWARM_BLOCK_STATE" in
+    malformed)
+      die_malformed_managed_block "$gi" "gitignore" "swarm install"
+      ;;
+    present)
+      local interior
+      interior="$(read_swarm_managed_block_interior "$gi" || true)"
+      if [[ "$interior" == "$desired" ]]; then
+        info "  ✓ .gitignore managed block already present"
+        return 0
+      fi
+      write_swarm_managed_block "$gi" "$desired"
+      info "  ✓ updated .gitignore managed block"
+      ;;
+    none)
+      write_swarm_managed_block "$gi" "$desired"
+      info "  ✓ added .gitignore managed block"
+      ;;
+  esac
 }
 
 init_new_workspace() {
@@ -1043,27 +1098,10 @@ Run \`swarm install\` from a terminal to configure this directory, or create swa
 EOF
   info "  ✓ created swarm.json"
 
-  cat >"$SWARM_ROOT/swarm.md" <<'EOF'
-# Swarm Workspace Instructions
-
-Add workspace-specific instructions for agents here.
-
-Examples:
-
-- work-management or MCP tools agents should use
-- repository-specific development conventions
-- feature/specification documentation requirements
-- host-specific build and test constraints
-
-Do not duplicate machine configuration from `swarm.json` or universal Swarm behavior from the Swarm skill.
-EOF
-  info "  ✓ created swarm.md"
-
   mkdir -p "$SWARM_ROOT/.swarm/submissions"
   if [[ ! -f "$SWARM_ROOT/.swarm/.gitignore" ]]; then
     printf '*\n!.gitignore\n' >"$SWARM_ROOT/.swarm/.gitignore"
   fi
-  ensure_gitignore_swarm_entry
   info "  ✓ Swarm root: $SWARM_ROOT"
 }
 
@@ -1094,9 +1132,11 @@ Remove or resolve it manually before rerunning installation."
   info "  ✓ $label $rel"
 }
 
-# Managed PATH block markers in ~/.bashrc (owned exclusively by Swarm).
-SWARM_BASHRC_START='# <-- swarm:start -->'
-SWARM_BASHRC_END='# <-- swarm:end -->'
+# Managed block markers (owned exclusively by Swarm) for ~/.bashrc and .gitignore.
+SWARM_BLOCK_START='# <-- swarm:start -->'
+SWARM_BLOCK_END='# <-- swarm:end -->'
+SWARM_BASHRC_START="$SWARM_BLOCK_START"
+SWARM_BASHRC_END="$SWARM_BLOCK_END"
 
 swarm_bashrc_path() {
   printf '%s\n' "${HOME}/.bashrc"
@@ -1124,77 +1164,79 @@ count_fixed_matches() {
 }
 
 # Validate managed markers. Sets:
-#   _SWARM_BASHRC_STATE = none|present|malformed
-#   _SWARM_BASHRC_START_LINE / _SWARM_BASHRC_END_LINE when present
-# Prints a human reason on malformed (via _SWARM_BASHRC_REASON).
-inspect_swarm_bashrc_block() {
+#   _SWARM_BLOCK_STATE = none|present|malformed
+#   _SWARM_BLOCK_START_LINE / _SWARM_BLOCK_END_LINE when present
+#   _SWARM_BLOCK_REASON on malformed
+inspect_swarm_managed_block() {
   local file="$1"
-  _SWARM_BASHRC_STATE="none"
-  _SWARM_BASHRC_REASON=""
-  _SWARM_BASHRC_START_LINE=0
-  _SWARM_BASHRC_END_LINE=0
+  _SWARM_BLOCK_STATE="none"
+  _SWARM_BLOCK_REASON=""
+  _SWARM_BLOCK_START_LINE=0
+  _SWARM_BLOCK_END_LINE=0
 
   if [[ ! -f "$file" ]]; then
     return 0
   fi
 
   local start_count end_count
-  start_count="$(count_fixed_matches "$SWARM_BASHRC_START" "$file")"
-  end_count="$(count_fixed_matches "$SWARM_BASHRC_END" "$file")"
+  start_count="$(count_fixed_matches "$SWARM_BLOCK_START" "$file")"
+  end_count="$(count_fixed_matches "$SWARM_BLOCK_END" "$file")"
 
   if [[ "$start_count" -eq 0 && "$end_count" -eq 0 ]]; then
-    _SWARM_BASHRC_STATE="none"
+    _SWARM_BLOCK_STATE="none"
     return 0
   fi
 
   if [[ "$start_count" -ne 1 || "$end_count" -ne 1 ]]; then
-    _SWARM_BASHRC_STATE="malformed"
-    _SWARM_BASHRC_REASON="expected exactly one '$SWARM_BASHRC_START' and one '$SWARM_BASHRC_END' (found start=$start_count end=$end_count)"
+    _SWARM_BLOCK_STATE="malformed"
+    _SWARM_BLOCK_REASON="expected exactly one '$SWARM_BLOCK_START' and one '$SWARM_BLOCK_END' (found start=$start_count end=$end_count)"
     return 0
   fi
 
-  _SWARM_BASHRC_START_LINE="$(grep -nF -- "$SWARM_BASHRC_START" "$file" | head -1 | cut -d: -f1)"
-  _SWARM_BASHRC_END_LINE="$(grep -nF -- "$SWARM_BASHRC_END" "$file" | head -1 | cut -d: -f1)"
+  _SWARM_BLOCK_START_LINE="$(grep -nF -- "$SWARM_BLOCK_START" "$file" | head -1 | cut -d: -f1)"
+  _SWARM_BLOCK_END_LINE="$(grep -nF -- "$SWARM_BLOCK_END" "$file" | head -1 | cut -d: -f1)"
 
-  if [[ "$_SWARM_BASHRC_START_LINE" -ge "$_SWARM_BASHRC_END_LINE" ]]; then
-    _SWARM_BASHRC_STATE="malformed"
-    _SWARM_BASHRC_REASON="start marker must appear before end marker (start=line $_SWARM_BASHRC_START_LINE end=line $_SWARM_BASHRC_END_LINE)"
+  if [[ "$_SWARM_BLOCK_START_LINE" -ge "$_SWARM_BLOCK_END_LINE" ]]; then
+    _SWARM_BLOCK_STATE="malformed"
+    _SWARM_BLOCK_REASON="start marker must appear before end marker (start=line $_SWARM_BLOCK_START_LINE end=line $_SWARM_BLOCK_END_LINE)"
     return 0
   fi
 
-  _SWARM_BASHRC_STATE="present"
+  _SWARM_BLOCK_STATE="present"
 }
 
-die_malformed_bashrc_block() {
+die_malformed_managed_block() {
   local file="$1"
-  die "Refusing to modify $file: Swarm-managed PATH block is malformed.
+  local kind="${2:-file}"
+  local hint="${3:-swarm install}"
+  die "Refusing to modify $file: Swarm-managed $kind block is malformed.
 
-$_SWARM_BASHRC_REASON
+$_SWARM_BLOCK_REASON
 
 Swarm only edits the region between:
-  $SWARM_BASHRC_START
-  $SWARM_BASHRC_END
+  $SWARM_BLOCK_START
+  $SWARM_BLOCK_END
 
-Fix or remove the broken markers manually, then rerun \`swarm install --path\`."
+Fix or remove the broken markers manually, then rerun \`$hint\`."
 }
 
-# Write managed block into bashrc: append if none, else replace existing block only.
-write_swarm_bashrc_block() {
+# Write managed block: append if none, else replace existing block interior only.
+# $1 = file, $2 = interior text (no markers; may be multi-line)
+write_swarm_managed_block() {
   local file="$1"
-  local export_line="$2"
+  local interior="$2"
   local tmp
   tmp="$(mktemp)"
 
-  inspect_swarm_bashrc_block "$file"
-  case "$_SWARM_BASHRC_STATE" in
+  inspect_swarm_managed_block "$file"
+  case "$_SWARM_BLOCK_STATE" in
     malformed)
       rm -f "$tmp"
-      die_malformed_bashrc_block "$file"
+      die_malformed_managed_block "$file"
       ;;
     none)
       rm -f "$tmp"
       if [[ -f "$file" && -s "$file" ]]; then
-        # Ensure a separating newline before the managed block.
         local last_char
         last_char="$(tail -c 1 "$file" 2>/dev/null || true)"
         if [[ -n "$last_char" && "$last_char" != $'\n' ]]; then
@@ -1206,24 +1248,21 @@ write_swarm_bashrc_block() {
         : >"$file"
       fi
       {
-        printf '%s\n' "$SWARM_BASHRC_START"
-        printf '%s\n' "$export_line"
-        printf '%s\n' "$SWARM_BASHRC_END"
+        printf '%s\n' "$SWARM_BLOCK_START"
+        printf '%s\n' "$interior"
+        printf '%s\n' "$SWARM_BLOCK_END"
       } >>"$file"
       ;;
     present)
       {
-        if [[ "$_SWARM_BASHRC_START_LINE" -gt 1 ]]; then
-          head -n "$((_SWARM_BASHRC_START_LINE - 1))" "$file"
+        if [[ "$_SWARM_BLOCK_START_LINE" -gt 1 ]]; then
+          head -n "$((_SWARM_BLOCK_START_LINE - 1))" "$file"
         fi
-        printf '%s\n' "$SWARM_BASHRC_START"
-        printf '%s\n' "$export_line"
-        printf '%s\n' "$SWARM_BASHRC_END"
-        tail -n "+$((_SWARM_BASHRC_END_LINE + 1))" "$file"
+        printf '%s\n' "$SWARM_BLOCK_START"
+        printf '%s\n' "$interior"
+        printf '%s\n' "$SWARM_BLOCK_END"
+        tail -n "+$((_SWARM_BLOCK_END_LINE + 1))" "$file"
       } >"$tmp"
-      # Replace file contents with reconstructed text (outside the managed
-      # markers is preserved byte-for-byte via head/tail). Never write a
-      # blank/replacement bashrc that drops user content.
       cat "$tmp" >"$file"
       rm -f "$tmp"
       ;;
@@ -1231,15 +1270,33 @@ write_swarm_bashrc_block() {
 }
 
 # Extract interior of managed block (lines strictly between markers) to stdout.
-read_swarm_bashrc_block_interior() {
+read_swarm_managed_block_interior() {
   local file="$1"
-  inspect_swarm_bashrc_block "$file"
-  [[ "$_SWARM_BASHRC_STATE" == "present" ]] || return 1
-  local start="$_SWARM_BASHRC_START_LINE" end="$_SWARM_BASHRC_END_LINE"
+  inspect_swarm_managed_block "$file"
+  [[ "$_SWARM_BLOCK_STATE" == "present" ]] || return 1
+  local start="$_SWARM_BLOCK_START_LINE" end="$_SWARM_BLOCK_END_LINE"
   if [[ "$((end - start))" -le 1 ]]; then
     return 0
   fi
   sed -n "$((start + 1)),$((end - 1))p" "$file"
+}
+
+# PATH-install wrappers keep prior function names for install_path_registration.
+inspect_swarm_bashrc_block() {
+  inspect_swarm_managed_block "$1"
+  _SWARM_BASHRC_STATE="$_SWARM_BLOCK_STATE"
+  _SWARM_BASHRC_REASON="$_SWARM_BLOCK_REASON"
+  _SWARM_BASHRC_START_LINE="$_SWARM_BLOCK_START_LINE"
+  _SWARM_BASHRC_END_LINE="$_SWARM_BLOCK_END_LINE"
+}
+die_malformed_bashrc_block() {
+  die_malformed_managed_block "$1" "PATH" "swarm install --path"
+}
+write_swarm_bashrc_block() {
+  write_swarm_managed_block "$1" "$2"
+}
+read_swarm_bashrc_block_interior() {
+  read_swarm_managed_block_interior "$1"
 }
 
 prompt_yes_default() {
@@ -1365,6 +1422,9 @@ usage: swarm install [--path] [--cursor] [--claude]" ;;
     init_new_workspace
     load_swarm_config_from_path
   fi
+
+  ensure_gitignore_swarm_block
+  ensure_swarm_md
 
   if [[ "$want_cursor" -eq 1 || "$want_claude" -eq 1 ]]; then
     info ""
