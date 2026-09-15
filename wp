@@ -55,7 +55,7 @@ usage() {
 WPCLI — parallel worktrees for Deploy component repos
 
 Usage:
-  ./wp create <repo> <work-id> [branch]
+  ./wp create <repo> <work-id> [branch] [--from <ref>] [--track <remote-branch>]
   ./wp list
   ./wp status [repo__work-id | path]
   ./wp sync <repo__work-id | path>
@@ -66,6 +66,10 @@ Usage:
 Convention:
   Worktree path:  services/<repo>__<work-id>
   Preferred id:   ticket number (2680) or short slug (billing-cleanup)
+  New branch:     task/<work-id> unless [branch] is given
+  Start point:    WP_BASE_REF (default origin/main) unless --from / --track
+  --track:        start from that remote branch and set it as upstream
+                  (--track implies --from when --from is omitted)
 
 Environment:
   WP_SERVICES_DIR   Override services/ location (default: <deploy>/services)
@@ -342,9 +346,61 @@ status_token() {
 # ---------------------------------------------------------------------------
 
 cmd_create() {
-  local repo="${1:-}" work_id="${2:-}" branch="${3:-}"
-  [[ -n "$repo" && -n "$work_id" ]] || die "usage: wp create <repo> <work-id> [branch] [--dry-run]"
+  local repo="" work_id="" branch="" from_ref="" track_ref=""
+  local positional=()
+  local usage_create='usage: wp create <repo> <work-id> [branch] [--from <ref>] [--track <remote-branch>]'
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from)
+        [[ -n "${2:-}" ]] || die "--from requires a ref
+$usage_create"
+        from_ref="$2"
+        shift 2
+        ;;
+      --from=*)
+        from_ref="${1#--from=}"
+        [[ -n "$from_ref" ]] || die "--from requires a ref"
+        shift
+        ;;
+      --track)
+        [[ -n "${2:-}" ]] || die "--track requires a remote branch
+$usage_create"
+        track_ref="$2"
+        shift 2
+        ;;
+      --track=*)
+        track_ref="${1#--track=}"
+        [[ -n "$track_ref" ]] || die "--track requires a remote branch"
+        shift
+        ;;
+      --dry-run)
+        DRY_RUN=1
+        shift
+        ;;
+      -*)
+        die "unknown flag: $1
+$usage_create"
+        ;;
+      *)
+        positional+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  repo="${positional[0]:-}"
+  work_id="${positional[1]:-}"
+  branch="${positional[2]:-}"
+  [[ -n "$repo" && -n "$work_id" ]] || die "$usage_create"
+  [[ ${#positional[@]} -le 3 ]] \
+    || die "unexpected argument: ${positional[3]}
+$usage_create"
   validate_work_id "$work_id"
+
+  # --track implies --from when --from is omitted.
+  if [[ -n "$track_ref" && -z "$from_ref" ]]; then
+    from_ref="$track_ref"
+  fi
 
   local repo_path wt_path
   repo_path="$(canonical_repo_path "$repo")"
@@ -354,11 +410,27 @@ cmd_create() {
     branch="task/${work_id}"
   fi
 
+  # Guard: remote-looking names belong in --from/--track, not as the worktree branch.
+  case "$branch" in
+    origin/*|refs/*|remotes/*)
+      die "refusing branch name '$branch' (looks like a starting ref).
+Use: wp create $repo $work_id --from $branch
+or:  wp create $repo $work_id --track $branch
+or:  wp create $repo $work_id task/${work_id} --track $branch"
+      ;;
+  esac
+
   # Idempotent reuse (read-only) — ok under dry-run
   if [[ -d "$wt_path" ]]; then
     if is_registered_worktree "$repo_path" "$wt_path"; then
       local existing_branch
       existing_branch="$(branch_of_worktree "$wt_path")"
+      if [[ -n "$from_ref" ]]; then
+        warn "--from ignored: worktree already exists (branch $existing_branch)"
+      fi
+      if [[ -n "$track_ref" ]]; then
+        warn "--track ignored: worktree already exists (branch $existing_branch)"
+      fi
       info "worktree already exists — reusing"
       info "  Repository: $repo"
       info "  Work:       $work_id"
@@ -369,14 +441,30 @@ cmd_create() {
     die "path exists but is not a registered worktree of $repo: $wt_path"
   fi
 
-  local plan
-  if git -C "$repo_path" show-ref --verify --quiet "refs/heads/$branch"; then
-    plan="git worktree add $wt_path $branch (existing local branch)"
-  elif git -C "$repo_path" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
-    plan="git fetch; git worktree add --track -b $branch $wt_path origin/$branch"
+  # Resolve default start point (canonical trunk) when --from/--track omitted.
+  local start_point
+  if [[ -n "$from_ref" ]]; then
+    start_point="$from_ref"
   else
     ensure_base_ref "$repo_path"
-    plan="git fetch; git worktree add --no-track -b $branch $wt_path $BASE_REF"
+    start_point="$BASE_REF"
+  fi
+
+  local plan created_new=1
+  if git -C "$repo_path" show-ref --verify --quiet "refs/heads/$branch"; then
+    created_new=0
+    plan="git worktree add $wt_path $branch (existing local branch)"
+    if [[ -n "$from_ref" ]]; then
+      plan="$plan; --from $from_ref ignored (branch already exists)"
+    fi
+    if [[ -n "$track_ref" ]]; then
+      plan="$plan; --track $track_ref ignored (branch already exists)"
+    fi
+  else
+    plan="git fetch; git worktree add -b $branch $wt_path $start_point"
+    if [[ -n "$track_ref" ]]; then
+      plan="$plan; git branch --set-upstream-to=$track_ref $branch"
+    fi
   fi
 
   if dry_run_exit "$plan"; then
@@ -386,7 +474,13 @@ cmd_create() {
   info "fetching origin in $repo …"
   git -C "$repo_path" fetch origin --prune 2>&1 | tail -n 5 || warn "fetch failed or had warnings"
 
-  ensure_base_ref "$repo_path"
+  # Re-resolve trunk after fetch when using the default start point.
+  if [[ -n "$from_ref" ]]; then
+    start_point="$from_ref"
+  else
+    ensure_base_ref "$repo_path"
+    start_point="$BASE_REF"
+  fi
 
   local occupied
   occupied="$(git -C "$repo_path" worktree list --porcelain | awk -v b="refs/heads/$branch" '
@@ -399,21 +493,35 @@ cmd_create() {
 
   local add_args=()
   if git -C "$repo_path" show-ref --verify --quiet "refs/heads/$branch"; then
+    if [[ -n "$from_ref" ]]; then
+      warn "--from ignored: local branch $branch already exists"
+    fi
+    if [[ -n "$track_ref" ]]; then
+      warn "--track ignored: local branch $branch already exists"
+    fi
     add_args=("$wt_path" "$branch")
     info "using existing local branch $branch"
-  elif git -C "$repo_path" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
-    add_args=("--track" "-b" "$branch" "$wt_path" "origin/$branch")
-    info "creating local branch $branch tracking origin/$branch"
+    created_new=0
   else
-    local start_point="$BASE_REF"
     if ! ref_exists "$repo_path" "$start_point"; then
-      die "cannot create branch from $start_point (missing)"
+      die "cannot create branch from '$start_point' (missing).
+Pass a local branch, remote-tracking branch, tag, or commit via --from / --track."
     fi
+    # Create local branch without auto-tracking; --track sets upstream explicitly.
     add_args=("--no-track" "-b" "$branch" "$wt_path" "$start_point")
     info "creating branch $branch from $start_point"
+    created_new=1
   fi
 
   git -C "$repo_path" worktree add "${add_args[@]}"
+
+  if [[ "$created_new" -eq 1 && -n "$track_ref" ]]; then
+    if ! ref_exists "$repo_path" "$track_ref"; then
+      die "cannot set upstream to '$track_ref' (missing after fetch)."
+    fi
+    git -C "$wt_path" branch --set-upstream-to="$track_ref" "$branch"
+    info "set upstream of $branch to $track_ref"
+  fi
 
   if [[ -f "$wt_path/pnpm-lock.yaml" ]]; then
     info "note: pnpm-lock.yaml present — run pnpm install in the worktree if needed (wp does not auto-install)"
@@ -425,7 +533,10 @@ cmd_create() {
   info "  Work:       $work_id"
   info "  Worktree:   $wt_path"
   info "  Branch:     $(branch_of_worktree "$wt_path")"
-  info "  Base:       $BASE_REF"
+  info "  From:       $start_point"
+  if [[ -n "$track_ref" && "$created_new" -eq 1 ]]; then
+    info "  Upstream:   $track_ref"
+  fi
 }
 
 cmd_list() {

@@ -81,7 +81,22 @@ Never create arbitrary alternate worktree directory structures.
 
 Do not develop in the canonical checkout when parallel work is expected.
 
-    swarm create <repo> <work-id> [branch]
+    swarm create <repo> <work-id> [branch] [--from <ref>] [--track <remote-branch>]
+
+`branch` is the new local branch for the worktree (default `task/<work-id>`).
+`--from` is an optional starting ref (local branch, remote-tracking branch,
+tag, or commit; default canonical trunk). `--track` starts from a remote
+branch and also sets it as the local branch's upstream (`--track` implies
+`--from` when `--from` is omitted). Both apply only when creating the branch;
+once it exists, Swarm tracks the local branch normally and does not manage
+remote fetch/rebase/push for you.
+
+Examples:
+
+    swarm create ts-mono 2676
+    swarm create ts-mono 2676 --from origin/fuzzy-search
+    swarm create ts-mono 2676 --track origin/fuzzy-search
+    swarm create ts-mono 2676 task/2676-fuzzy --track origin/fuzzy-search
 
 If the worktree already exists, reuse it. Do not create another branch or
 worktree for the same unit of work.

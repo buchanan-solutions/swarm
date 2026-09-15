@@ -309,7 +309,7 @@ Read-only:
   swarm review <repo__work-id>
 
 Agent writes (--dry-run supported):
-  swarm create <repo> <work-id> [branch] [--dry-run]
+  swarm create <repo> <work-id> [branch] [--from <ref>] [--track <remote-branch>] [--dry-run]
   swarm sync <repo__work-id> [--dry-run]
   swarm submit <repo__work-id> [--dry-run]
 
@@ -570,17 +570,85 @@ EOF
 
 cmd_create() {
   require_wp
-  local repo="${1:-}" work_id="${2:-}" branch="${3:-}"
-  [[ -n "$repo" && -n "$work_id" ]] || die "usage: swarm create <repo> <work-id> [branch] [--dry-run]"
+  local repo="" work_id="" branch="" from_ref="" track_ref=""
+  local positional=()
+  local usage_create='usage: swarm create <repo> <work-id> [branch] [--from <ref>] [--track <remote-branch>] [--dry-run]'
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from)
+        [[ -n "${2:-}" ]] || die "--from requires a ref
+$usage_create"
+        from_ref="$2"
+        shift 2
+        ;;
+      --from=*)
+        from_ref="${1#--from=}"
+        [[ -n "$from_ref" ]] || die "--from requires a ref"
+        shift
+        ;;
+      --track)
+        [[ -n "${2:-}" ]] || die "--track requires a remote branch
+$usage_create"
+        track_ref="$2"
+        shift 2
+        ;;
+      --track=*)
+        track_ref="${1#--track=}"
+        [[ -n "$track_ref" ]] || die "--track requires a remote branch"
+        shift
+        ;;
+      -*)
+        die "unknown flag: $1
+$usage_create"
+        ;;
+      *)
+        positional+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  repo="${positional[0]:-}"
+  work_id="${positional[1]:-}"
+  branch="${positional[2]:-}"
+  [[ -n "$repo" && -n "$work_id" ]] || die "$usage_create"
+  [[ ${#positional[@]} -le 3 ]] \
+    || die "unexpected argument: ${positional[3]}
+$usage_create"
   repo_authorized "$repo" || die "repository '$repo' is not listed in $SWARM_CONFIG_PATH (repos)"
+
   if [[ -z "$branch" ]]; then
     branch="task/${work_id}"
   fi
+
+  case "$branch" in
+    origin/*|refs/*|remotes/*)
+      die "refusing branch name '$branch' (looks like a starting ref).
+Use: swarm create $repo $work_id --from $branch
+or:  swarm create $repo $work_id --track $branch
+or:  swarm create $repo $work_id task/${work_id} --track $branch"
+      ;;
+  esac
+
   local wt_path="$REPOS_DIR/${repo}__${work_id}"
-  if dry_run_exit "create worktree $wt_path on branch $branch (via wp create $repo $work_id $branch)"; then
+  local plan="create worktree $wt_path on branch $branch"
+  if [[ -n "$from_ref" ]]; then
+    plan="$plan from $from_ref"
+  elif [[ -n "$track_ref" ]]; then
+    plan="$plan from $track_ref"
+  fi
+  if [[ -n "$track_ref" ]]; then
+    plan="$plan tracking $track_ref"
+  fi
+  plan="$plan (via wp create)"
+  if dry_run_exit "$plan"; then
     return 0
   fi
-  "$WP" create "$repo" "$work_id" "$branch"
+
+  local wp_args=("$repo" "$work_id" "$branch")
+  [[ -n "$from_ref" ]] && wp_args+=(--from "$from_ref")
+  [[ -n "$track_ref" ]] && wp_args+=(--track "$track_ref")
+  "$WP" create "${wp_args[@]}"
 }
 
 cmd_sync() {
@@ -675,8 +743,8 @@ cmd_list() {
   printf 'ROOT\t%s\n' "$SWARM_ROOT"
   printf 'CONFIG\t%s\n' "$SWARM_CONFIG_PATH"
   printf '\n'
-  printf '%-12s %-10s %-36s %-12s\n' "REPO" "WORK" "BRANCH" "STATE"
-  local repo current_wt current_branch wt_line state repo_dir
+  printf '%-12s %-10s %-28s %-36s %-12s\n' "REPO" "WORK" "WORKTREE" "BRANCH" "STATE"
+  local repo current_wt current_branch wt_line state repo_dir wt_name
   for repo in $REPOS_LIST; do
     repo_dir="$REPOS_DIR/$repo"
     [[ -d "$repo_dir" ]] || continue
@@ -694,8 +762,9 @@ cmd_list() {
           parse_id "$(basename "$current_wt")" || true
           if [[ "${_repo:-}" == "$repo" ]]; then
             state="$(swarm_state "$current_wt" 2>/dev/null || echo '?')"
-            printf '%-12s %-10s %-36s %-12s\n' \
-              "$repo" "${_work:-?}" "${current_branch:-DETACHED}" "$state"
+            wt_name="$(basename "$current_wt")"
+            printf '%-12s %-10s %-28s %-36s %-12s\n' \
+              "$repo" "${_work:-?}" "$wt_name" "${current_branch:-DETACHED}" "$state"
           fi
         fi
         current_wt=""
@@ -714,7 +783,7 @@ cmd_list() {
       mid="${BASH_REMATCH[1]}"
     fi
     if [[ ! -d "$REPOS_DIR/$mid" ]]; then
-      printf '%-12s %-10s %-36s %-12s\n' "?" "?" "$(basename "$m")" "ORPHAN"
+      printf '%-12s %-10s %-28s %-36s %-12s\n' "?" "?" "$mid" "$(basename "$m")" "ORPHAN"
       warn "orphan submission marker: $(basename "$m") → expected $REPOS_DIR/$mid"
     fi
   done

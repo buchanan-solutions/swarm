@@ -182,7 +182,7 @@ Being behind trunk is not, by itself, a problem.
 swarm install [--cursor] [--claude]
 swarm config
 
-swarm create <repo> <work-id> [branch]
+swarm create <repo> <work-id> [branch] [--from <ref>] [--track <remote-branch>]
 swarm list
 swarm check <worktree>
 swarm sync <worktree>
