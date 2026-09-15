@@ -1,0 +1,5 @@
+# local scratch (not Swarm protocol)
+combined.txt
+
+# disposable local sandbox for developing the CLI (see docs/DEVELOPMENT.md)
+/test/

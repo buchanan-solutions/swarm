@@ -1,0 +1,1434 @@
+#!/usr/bin/env bash
+# Swarm — agent worktrees + human integration inbox (submission markers).
+# Config: swarm.json (walk up from $PWD). Skill template: swarm/skills/swarm/SKILL.md
+set -euo pipefail
+
+SWARM_VERSION="0.1.0"
+SWARM_CONFIG_NAME="swarm.json"
+SUPPORTED_CONFIG_VERSION=1
+
+# Set by load_swarm_config (except help/version/install bootstrap)
+SWARM_ROOT=""
+SWARM_CONFIG_PATH=""
+REPOS_DIR=""
+STATE_DIR=""
+SUBMISSIONS_DIR=""
+# space-separated authorized repo names
+REPOS_LIST=""
+CLI_DIR=""
+WP=""
+BASE_REF="${WP_BASE_REF:-origin/main}"
+DRY_RUN=0
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+info() { printf '%s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+
+cli_dir() {
+  local src="${BASH_SOURCE[0]}"
+  local dir
+  dir="$(cd "$(dirname "$src")" && pwd)"
+  if [[ -L "$src" ]]; then
+    src="$(readlink -f "$src")"
+    dir="$(cd "$(dirname "$src")" && pwd)"
+  fi
+  printf '%s\n' "$dir"
+}
+
+CLI_DIR="$(cli_dir)"
+# Bundled internal dependency — always next to this script
+WP="$CLI_DIR/wp"
+SKILL_TEMPLATE="$CLI_DIR/skills/swarm/SKILL.md"
+
+require_jq() {
+  command -v jq >/dev/null 2>&1 || die "jq is required to read $SWARM_CONFIG_NAME (install jq)"
+}
+
+# Walk $PWD and parents for swarm.json. Sets SWARM_ROOT + SWARM_CONFIG_PATH.
+# Returns 0 if found, 1 if not.
+try_find_swarm_config() {
+  local dir
+  dir="$(pwd -P)"
+  while true; do
+    if [[ -f "$dir/$SWARM_CONFIG_NAME" ]]; then
+      SWARM_ROOT="$dir"
+      SWARM_CONFIG_PATH="$dir/$SWARM_CONFIG_NAME"
+      return 0
+    fi
+    if [[ "$dir" == "/" ]]; then
+      break
+    fi
+    local parent
+    parent="$(dirname "$dir")"
+    [[ "$parent" == "$dir" ]] && break
+    dir="$parent"
+  done
+  return 1
+}
+
+# Walk $PWD and parents for swarm.json. Sets SWARM_ROOT + SWARM_CONFIG_PATH or dies.
+find_swarm_config() {
+  try_find_swarm_config || die "no $SWARM_CONFIG_NAME found in current directory or any parent"
+}
+
+# Resolve path relative to SWARM_ROOT; reject escapes outside root. May create dir.
+resolve_under_root() {
+  local rel="$1"
+  local label="$2"
+  [[ -n "$rel" ]] || die "invalid $SWARM_CONFIG_NAME: $label is empty"
+  if [[ "$rel" == /* ]]; then
+    die "invalid $SWARM_CONFIG_NAME: $label must be relative to SWARM_ROOT (got absolute: $rel)"
+  fi
+  case "$rel" in
+    *..*) die "invalid $SWARM_CONFIG_NAME: $label must not contain '..' (got: $rel)" ;;
+  esac
+  mkdir -p "$SWARM_ROOT/$rel"
+  local abs
+  abs="$(cd "$SWARM_ROOT/$rel" && pwd -P)"
+  case "$abs" in
+    "$SWARM_ROOT"|"$SWARM_ROOT"/*) printf '%s\n' "$abs" ;;
+    *) die "invalid $SWARM_CONFIG_NAME: $label escapes SWARM_ROOT ($abs)" ;;
+  esac
+}
+
+# Like resolve_under_root but do not mkdir (for repos_dir which must already exist).
+resolve_existing_under_root() {
+  local rel="$1"
+  local label="$2"
+  [[ -n "$rel" ]] || die "invalid $SWARM_CONFIG_NAME: $label is empty"
+  if [[ "$rel" == /* ]]; then
+    die "invalid $SWARM_CONFIG_NAME: $label must be relative to SWARM_ROOT (got absolute: $rel)"
+  fi
+  case "$rel" in
+    *..*) die "invalid $SWARM_CONFIG_NAME: $label must not contain '..' (got: $rel)" ;;
+  esac
+  local candidate="$SWARM_ROOT/$rel"
+  [[ -d "$candidate" ]] || die "invalid $SWARM_CONFIG_NAME: $label does not exist: $rel"
+  local abs
+  abs="$(cd "$candidate" && pwd -P)"
+  case "$abs" in
+    "$SWARM_ROOT"|"$SWARM_ROOT"/*) printf '%s\n' "$abs" ;;
+    *) die "invalid $SWARM_CONFIG_NAME: $label escapes SWARM_ROOT ($abs)" ;;
+  esac
+}
+
+repo_authorized() {
+  local repo="$1"
+  local r
+  for r in $REPOS_LIST; do
+    [[ "$r" == "$repo" ]] && return 0
+  done
+  return 1
+}
+
+# Validate and load swarm.json already pointed to by SWARM_CONFIG_PATH / SWARM_ROOT.
+load_swarm_config_from_path() {
+  require_jq
+  [[ -n "$SWARM_CONFIG_PATH" && -f "$SWARM_CONFIG_PATH" ]] \
+    || die "invalid $SWARM_CONFIG_NAME: path not set"
+
+  if ! jq -e '.' "$SWARM_CONFIG_PATH" >/dev/null 2>&1; then
+    die "invalid Swarm configuration
+
+Config:
+  $SWARM_CONFIG_PATH
+
+Problem:
+  malformed JSON (jq could not parse the file).
+
+The existing Swarm workspace was not modified.
+Fix swarm.json and rerun."
+  fi
+
+  local version repos_dir_rel state_dir_rel
+  version="$(jq -r '.version // empty' "$SWARM_CONFIG_PATH")"
+  [[ "$version" == "$SUPPORTED_CONFIG_VERSION" ]] \
+    || die "invalid Swarm configuration
+
+Config:
+  $SWARM_CONFIG_PATH
+
+Problem:
+  unsupported or missing version '$version' (need $SUPPORTED_CONFIG_VERSION).
+
+The existing Swarm workspace was not modified.
+Fix swarm.json and rerun."
+
+  repos_dir_rel="$(jq -r '.repos_dir // empty' "$SWARM_CONFIG_PATH")"
+  state_dir_rel="$(jq -r '.state_dir // empty' "$SWARM_CONFIG_PATH")"
+  [[ -n "$repos_dir_rel" ]] || die "invalid Swarm configuration
+
+Config:
+  $SWARM_CONFIG_PATH
+
+Problem:
+  \"repos_dir\" must be a string.
+
+The existing Swarm workspace was not modified.
+Fix swarm.json and rerun."
+  [[ -n "$state_dir_rel" ]] || die "invalid Swarm configuration
+
+Config:
+  $SWARM_CONFIG_PATH
+
+Problem:
+  \"state_dir\" must be a string.
+
+The existing Swarm workspace was not modified.
+Fix swarm.json and rerun."
+
+  REPOS_DIR="$(resolve_existing_under_root "$repos_dir_rel" "repos_dir")"
+  mkdir -p "$SWARM_ROOT/$state_dir_rel/submissions"
+  STATE_DIR="$(resolve_under_root "$state_dir_rel" "state_dir")"
+  SUBMISSIONS_DIR="$STATE_DIR/submissions"
+  mkdir -p "$SUBMISSIONS_DIR"
+
+  REPOS_LIST=""
+  if ! jq -e '.repos | type == "array"' "$SWARM_CONFIG_PATH" >/dev/null 2>&1; then
+    die "invalid Swarm configuration
+
+Config:
+  $SWARM_CONFIG_PATH
+
+Problem:
+  \"repos\" must be an array of repository names.
+
+The existing Swarm workspace was not modified.
+Fix swarm.json and rerun."
+  fi
+
+  local repo n i path
+  n="$(jq -r '.repos | length' "$SWARM_CONFIG_PATH")"
+  for ((i = 0; i < n; i++)); do
+    repo="$(jq -r --argjson i "$i" '.repos[$i]' "$SWARM_CONFIG_PATH")"
+    [[ -n "$repo" && "$repo" != "null" ]] || die "invalid Swarm configuration
+
+Config:
+  $SWARM_CONFIG_PATH
+
+Problem:
+  empty repos[$i].
+
+The existing Swarm workspace was not modified.
+Fix swarm.json and rerun."
+    [[ "$repo" != *"/"* && "$repo" != *"__"* ]] \
+      || die "invalid Swarm configuration
+
+Config:
+  $SWARM_CONFIG_PATH
+
+Problem:
+  repo name must be bare (got: $repo).
+
+The existing Swarm workspace was not modified.
+Fix swarm.json and rerun."
+    path="$REPOS_DIR/$repo"
+    if [[ ! -d "$path" ]]; then
+      die "invalid Swarm configuration
+
+Config:
+  $SWARM_CONFIG_PATH
+
+Problem:
+  configured repository does not exist:
+  $repos_dir_rel/$repo
+
+The existing Swarm workspace was not modified.
+Fix swarm.json and rerun."
+    fi
+    if [[ ! -e "$path/.git" && ! -d "$path/.git" ]]; then
+      die "invalid Swarm configuration
+
+Config:
+  $SWARM_CONFIG_PATH
+
+Problem:
+  configured repository is not a Git repo:
+  $repos_dir_rel/$repo
+
+The existing Swarm workspace was not modified.
+Fix swarm.json and rerun."
+    fi
+    REPOS_LIST+="$repo "
+  done
+}
+
+load_swarm_config() {
+  find_swarm_config
+  load_swarm_config_from_path
+}
+
+require_wp() {
+  [[ -x "$WP" ]] || die "bundled wp missing/not executable: $WP"
+  export WP_SERVICES_DIR="$REPOS_DIR"
+}
+
+# If DRY_RUN=1, print planned action and return 0 (caller returns). Else return 1.
+dry_run_exit() {
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    info "DRY-RUN: $*"
+    info "DRY-RUN: no changes made. Re-run without --dry-run to apply."
+    return 0
+  fi
+  return 1
+}
+
+# Strip --dry-run from args; sets DRY_RUN and leaves remaining in _ARGS.
+consume_dry_run_args() {
+  _ARGS=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) DRY_RUN=1; shift ;;
+      *) _ARGS+=("$1"); shift ;;
+    esac
+  done
+}
+
+usage() {
+  cat <<'EOF'
+swarm — parallel worktrees + submission inbox
+
+Meta (no workspace required):
+  swarm version
+  swarm help
+
+Most other commands require swarm.json in $PWD or an ancestor (becomes SWARM_ROOT). Needs jq.
+
+Bootstrap:
+  swarm install
+  swarm install --path
+  swarm install --cursor
+  swarm install --claude
+  swarm install --cursor --claude
+  swarm install --path --cursor --claude
+
+Read-only:
+  swarm config
+  swarm list
+  swarm check <repo__work-id>
+  swarm review <repo__work-id>
+
+Agent writes (--dry-run supported):
+  swarm create <repo> <work-id> [branch] [--dry-run]
+  swarm sync <repo__work-id> [--dry-run]
+  swarm submit <repo__work-id> [--dry-run]
+
+Human writes:
+  swarm integrate <repo__work-id> [-m "msg"] [--dry-run]
+  swarm remove <repo__work-id> --confirm
+  swarm remove <repo__work-id> --confirm -d
+
+Agents MUST NOT run: integrate, remove
+
+install: ensure jq, discover or initialize workspace, optionally copy skills.
+install --path: manage a Swarm-owned PATH block in ~/.bashrc (Bash only).
+swarm config: print resolved root, swarm.json, and swarm.md.
+
+Topology:   <SWARM_ROOT>/swarm.json
+Workspace:  <SWARM_ROOT>/swarm.md (optional agent instructions)
+State:      <SWARM_ROOT>/.swarm/submissions/<repo>__<work-id>
+Worktrees:  <repos_dir>/<repo>__<work-id>/
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Identity / submissions
+# ---------------------------------------------------------------------------
+
+normalize_worktree_id() {
+  # → prints repo__work-id
+  local arg="${1:-}"
+  [[ -n "$arg" ]] || die "worktree id required"
+  local repos_base
+  repos_base="$(basename "$REPOS_DIR")"
+  arg="${arg#./}"
+  if [[ "$arg" == "$repos_base/"* ]]; then
+    arg="${arg#"$repos_base"/}"
+  fi
+  arg="${arg%/}"
+  if [[ "$arg" == *"__"* && "$arg" != *"/"* ]]; then
+    printf '%s\n' "$arg"
+    return 0
+  fi
+  if [[ "$arg" == */* && "$arg" != *"__"* ]]; then
+    local repo="${arg%%/*}" rest="${arg#*/}"
+    [[ "$rest" != *"/"* ]] || die "use repo__work-id: $arg"
+    printf '%s\n' "${repo}__${rest}"
+    return 0
+  fi
+  if [[ "$arg" == /* ]]; then
+    local base
+    base="$(basename "$arg")"
+    [[ "$base" == *"__"* ]] || die "not a swarm worktree path: $arg"
+    printf '%s\n' "$base"
+    return 0
+  fi
+  die "expected repo__work-id (got: $arg)"
+}
+
+worktree_abs() {
+  local id
+  id="$(normalize_worktree_id "$1")"
+  printf '%s\n' "$REPOS_DIR/$id"
+}
+
+canonical_abs() {
+  local id repo
+  id="$(normalize_worktree_id "$1")"
+  repo="${id%%__*}"
+  printf '%s\n' "$REPOS_DIR/$repo"
+}
+
+parse_id() {
+  local id
+  id="$(normalize_worktree_id "$1")"
+  _id="$id"
+  _repo="${id%%__*}"
+  _work="${id#*__}"
+}
+
+marker_path() {
+  local id
+  id="$(normalize_worktree_id "$1")"
+  printf '%s\n' "$SUBMISSIONS_DIR/$id"
+}
+
+has_submission() {
+  local m
+  m="$(marker_path "$1")"
+  [[ -e "$m" ]]
+}
+
+touch_submission() {
+  mkdir -p "$SUBMISSIONS_DIR"
+  local m
+  m="$(marker_path "$1")"
+  : >"$m"
+  info "submitted: $(basename "$m")"
+}
+
+clear_submission() {
+  local m
+  m="$(marker_path "$1")"
+  if [[ -e "$m" ]]; then
+    rm -f "$m"
+    info "cleared submission marker: $(basename "$m")"
+  fi
+  # Also clear legacy timestamp-prefixed markers for same worktree
+  local id base
+  id="$(normalize_worktree_id "$1")"
+  shopt -s nullglob
+  for base in "$SUBMISSIONS_DIR/"*"__${id}" "$SUBMISSIONS_DIR/"*"${id}"; do
+    [[ -e "$base" ]] || continue
+    [[ "$(basename "$base")" == "$id" ]] && continue
+    # only remove if basename ends with __repo__work or equals patterns like DATE__repo__work
+    if [[ "$(basename "$base")" == *"__${id}" || "$(basename "$base")" == "$id" ]]; then
+      rm -f "$base"
+      info "cleared legacy marker: $(basename "$base")"
+    fi
+  done
+  shopt -u nullglob
+}
+
+# Legacy: 2026-09-15-0011__ts-mono__2680 → treat as submission for ts-mono__2680
+legacy_submission_for() {
+  local id="$1"
+  local f
+  shopt -s nullglob
+  for f in "$SUBMISSIONS_DIR/"*"__${id}"; do
+    if [[ -e "$f" ]]; then
+      printf '%s\n' "$f"
+      shopt -u nullglob
+      return 0
+    fi
+  done
+  shopt -u nullglob
+  return 1
+}
+
+is_submitted() {
+  has_submission "$1" && return 0
+  legacy_submission_for "$(normalize_worktree_id "$1")" >/dev/null 2>&1
+}
+
+ensure_worktree() {
+  local wt id repo
+  id="$(normalize_worktree_id "$1")"
+  repo="${id%%__*}"
+  repo_authorized "$repo" || die "repository '$repo' is not listed in $SWARM_CONFIG_PATH (repos)"
+  wt="$(worktree_abs "$id")"
+  [[ -d "$wt" ]] || die "worktree not found: $wt"
+  [[ -e "$wt/.git" || -d "$wt/.git" ]] || die "not a git worktree: $wt"
+  printf '%s\n' "$wt"
+}
+
+working_tree_state() {
+  local dir="$1"
+  if [[ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ]]; then
+    printf 'dirty\n'
+  else
+    printf 'clean\n'
+  fi
+}
+
+ref_exists() {
+  git -C "$1" rev-parse --verify --quiet "$2" >/dev/null 2>&1
+}
+
+trunk_ref() {
+  # Prefer live canonical checkout HEAD (integrator trunk), else BASE_REF
+  local canon="$1"
+  if [[ -d "$canon" ]] && ( [[ -e "$canon/.git" ]] || [[ -d "$canon/.git" ]] ); then
+    git -C "$canon" rev-parse HEAD
+    return 0
+  fi
+  die "canonical repo missing: $canon"
+}
+
+mergeability_vs_trunk() {
+  local wt="$1" canon="$2"
+  local trunk
+  trunk="$(trunk_ref "$canon")"
+  local out rc
+  if git merge-tree --write-tree -h >/dev/null 2>&1; then
+    set +e
+    out="$(git -C "$wt" merge-tree --write-tree HEAD "$trunk" 2>&1)"
+    rc=$?
+    set -e
+    if [[ $rc -eq 0 ]]; then printf 'CLEAN\n'; else printf 'CONFLICT\n'; fi
+    return 0
+  fi
+  local base
+  base="$(git -C "$wt" merge-base HEAD "$trunk" 2>/dev/null || true)"
+  [[ -n "$base" ]] || { printf 'UNKNOWN\n'; return 0; }
+  set +e
+  out="$(git -C "$wt" merge-tree "$base" HEAD "$trunk" 2>&1)"
+  set -e
+  if printf '%s\n' "$out" | grep -qE 'changed in both|CONFLICT|\+<<<<<<<'; then
+    printf 'CONFLICT\n'
+  else
+    printf 'CLEAN\n'
+  fi
+}
+
+branch_of() {
+  git -C "$1" rev-parse --abbrev-ref HEAD
+}
+
+# Dashboard state for one worktree
+swarm_state() {
+  local wt="$1" id
+  id="$(basename "$wt")"
+  local dirty merge canon
+  dirty="$(working_tree_state "$wt")"
+  if [[ "$dirty" == "dirty" ]]; then
+    printf 'DIRTY\n'
+    return 0
+  fi
+  canon="$(canonical_abs "$id")"
+  merge="$(mergeability_vs_trunk "$wt" "$canon" 2>/dev/null || echo UNKNOWN)"
+  if [[ "$merge" == "CONFLICT" ]]; then
+    printf 'CONFLICT\n'
+    return 0
+  fi
+  if is_submitted "$id"; then
+    printf 'SUBMITTED\n'
+    return 0
+  fi
+  printf 'ACTIVE\n'
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_config() {
+  local md_path="$SWARM_ROOT/swarm.md"
+  cat <<EOF
+# Swarm Configuration
+
+**Root:** \`$SWARM_ROOT\`
+**Config:** \`$SWARM_CONFIG_PATH\`
+
+\`\`\`json
+$(jq '.' "$SWARM_CONFIG_PATH")
+\`\`\`
+
+---
+
+# Swarm Workspace Instructions
+
+EOF
+  if [[ -f "$md_path" ]]; then
+    cat "$md_path"
+    # ensure trailing newline
+    [[ -z "$(tail -c 1 "$md_path" 2>/dev/null || true)" ]] || printf '\n'
+  else
+    printf '_No workspace-specific instructions._\n'
+  fi
+}
+
+cmd_create() {
+  require_wp
+  local repo="${1:-}" work_id="${2:-}" branch="${3:-}"
+  [[ -n "$repo" && -n "$work_id" ]] || die "usage: swarm create <repo> <work-id> [branch] [--dry-run]"
+  repo_authorized "$repo" || die "repository '$repo' is not listed in $SWARM_CONFIG_PATH (repos)"
+  if [[ -z "$branch" ]]; then
+    branch="task/${work_id}"
+  fi
+  local wt_path="$REPOS_DIR/${repo}__${work_id}"
+  if dry_run_exit "create worktree $wt_path on branch $branch (via wp create $repo $work_id $branch)"; then
+    return 0
+  fi
+  "$WP" create "$repo" "$work_id" "$branch"
+}
+
+cmd_sync() {
+  require_wp
+  local id
+  id="$(normalize_worktree_id "${1:-}")"
+  local wt
+  wt="$(ensure_worktree "$id")"
+  local plan="merge integration base into $(branch_of "$wt") in $wt"
+  if is_submitted "$id"; then
+    plan="$plan; clear submission marker $SUBMISSIONS_DIR/$id"
+  fi
+  if dry_run_exit "$plan"; then
+    return 0
+  fi
+  if is_submitted "$id"; then
+    warn "clearing submission marker (sync may change branch tip)"
+    clear_submission "$id"
+  fi
+  "$WP" sync "$id"
+}
+
+cmd_check() {
+  local id wt canon branch dirty merge ahead behind
+  id="$(normalize_worktree_id "${1:-}")"
+  wt="$(ensure_worktree "$id")"
+  canon="$(canonical_abs "$id")"
+  branch="$(branch_of "$wt")"
+  dirty="$(working_tree_state "$wt")"
+  merge="$(mergeability_vs_trunk "$wt" "$canon")"
+
+  ahead="$(git -C "$wt" rev-list --count "$(trunk_ref "$canon")"..HEAD 2>/dev/null || echo 0)"
+  behind="$(git -C "$wt" rev-list --count HEAD.."$(trunk_ref "$canon")" 2>/dev/null || echo 0)"
+
+  cat <<EOF
+Worktree:     ${id}  (${wt#"$SWARM_ROOT"/})
+Branch:       $branch
+Trunk:        $canon (HEAD)
+
+Working tree: $dirty
+Ahead:        $ahead commits
+Behind:       $behind commits
+Mergeability: $merge
+Submitted:    $(is_submitted "$id" && echo yes || echo no)
+EOF
+
+  printf '\n'
+  if [[ "$dirty" != "clean" ]]; then
+    info "Action: COMMIT — clean the worktree before submit."
+    return 1
+  fi
+  if [[ "$merge" == "CONFLICT" ]]; then
+    info "Action: SYNC REQUIRED — ./swarm/swarm sync $id"
+    return 1
+  fi
+  if is_submitted "$id"; then
+    info "Action: NONE — already SUBMITTED (awaiting human review)."
+    return 0
+  fi
+  info "Action: READY TO SUBMIT — ./swarm/swarm submit $id"
+  return 0
+}
+
+cmd_submit() {
+  local id wt canon dirty merge
+  id="$(normalize_worktree_id "${1:-}")"
+  wt="$(ensure_worktree "$id")"
+  canon="$(canonical_abs "$id")"
+  dirty="$(working_tree_state "$wt")"
+  [[ "$dirty" == "clean" ]] || die "worktree is dirty; commit before submit"
+  merge="$(mergeability_vs_trunk "$wt" "$canon")"
+  if [[ "$merge" == "CONFLICT" ]]; then
+    die "conflicts vs current trunk — run: ./swarm/swarm sync $id"
+  fi
+  if [[ "$merge" == "UNKNOWN" ]]; then
+    die "could not determine mergeability vs trunk"
+  fi
+  local ahead
+  ahead="$(git -C "$wt" rev-list --count "$(trunk_ref "$canon")"..HEAD 2>/dev/null || echo 0)"
+  [[ "${ahead:-0}" -gt 0 ]] || die "no commits ahead of trunk — nothing to submit"
+
+  if dry_run_exit "touch $SUBMISSIONS_DIR/$id (SUBMITTED); $ahead commit(s) ahead of trunk"; then
+    return 0
+  fi
+
+  touch_submission "$id"
+  info ""
+  info "Inbox marker written. Human: ./swarm/swarm review $id"
+}
+
+cmd_list() {
+  printf 'ROOT\t%s\n' "$SWARM_ROOT"
+  printf 'CONFIG\t%s\n' "$SWARM_CONFIG_PATH"
+  printf '\n'
+  printf '%-12s %-10s %-36s %-12s\n' "REPO" "WORK" "BRANCH" "STATE"
+  local repo current_wt current_branch wt_line state repo_dir
+  for repo in $REPOS_LIST; do
+    repo_dir="$REPOS_DIR/$repo"
+    [[ -d "$repo_dir" ]] || continue
+
+    current_wt=""
+    current_branch=""
+    while IFS= read -r wt_line || [[ -n "$wt_line" ]]; do
+      if [[ "$wt_line" == worktree\ * ]]; then
+        current_wt="${wt_line#worktree }"
+        current_branch=""
+      elif [[ "$wt_line" == branch\ * ]]; then
+        current_branch="${wt_line#branch refs/heads/}"
+      elif [[ -z "$wt_line" && -n "$current_wt" ]]; then
+        if [[ "$(basename "$current_wt")" == *"__"* ]]; then
+          parse_id "$(basename "$current_wt")" || true
+          if [[ "${_repo:-}" == "$repo" ]]; then
+            state="$(swarm_state "$current_wt" 2>/dev/null || echo '?')"
+            printf '%-12s %-10s %-36s %-12s\n' \
+              "$repo" "${_work:-?}" "${current_branch:-DETACHED}" "$state"
+          fi
+        fi
+        current_wt=""
+        current_branch=""
+      fi
+    done < <(git -C "$repo_dir" worktree list --porcelain; printf '\n')
+  done
+
+  # Orphan submission markers (no worktree)
+  local m mid
+  shopt -s nullglob
+  for m in "$SUBMISSIONS_DIR"/*; do
+    [[ -f "$m" ]] || continue
+    mid="$(basename "$m")"
+    if [[ "$mid" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]+__(.+__.+)$ ]]; then
+      mid="${BASH_REMATCH[1]}"
+    fi
+    if [[ ! -d "$REPOS_DIR/$mid" ]]; then
+      printf '%-12s %-10s %-36s %-12s\n' "?" "?" "$(basename "$m")" "ORPHAN"
+      warn "orphan submission marker: $(basename "$m") → expected $REPOS_DIR/$mid"
+    fi
+  done
+  shopt -u nullglob
+}
+
+cmd_review() {
+  local id wt canon branch dirty merge ahead
+  id="$(normalize_worktree_id "${1:-}")"
+  wt="$(ensure_worktree "$id")"
+  canon="$(canonical_abs "$id")"
+  branch="$(branch_of "$wt")"
+  dirty="$(working_tree_state "$wt")"
+  merge="$(mergeability_vs_trunk "$wt" "$canon")"
+  local trunk
+  trunk="$(trunk_ref "$canon")"
+  ahead="$(git -C "$wt" rev-list --count "$trunk"..HEAD 2>/dev/null || echo 0)"
+
+  if ! is_submitted "$id"; then
+    warn "no submission marker — reviewing anyway"
+  fi
+
+  local shortstat files
+  shortstat="$(git -C "$wt" diff --shortstat "$trunk"...HEAD 2>/dev/null || true)"
+  files="$(git -C "$wt" diff --name-only "$trunk"...HEAD 2>/dev/null | wc -l | tr -d ' ')"
+
+  cat <<EOF
+Submission:   $id
+
+Branch:       $branch
+Commits:      $ahead
+Changes:      $files files
+              ${shortstat:-"(no diff vs trunk)"}
+
+Checks:
+EOF
+
+  if [[ "$dirty" == "clean" ]]; then
+    info "  ✓ clean worktree"
+  else
+    info "  ✗ dirty worktree"
+  fi
+
+  if [[ "$merge" == "CLEAN" ]]; then
+    info "  ✓ clean against current trunk ($canon)"
+  elif [[ "$merge" == "CONFLICT" ]]; then
+    info "  ✗ CONFLICT against current trunk"
+  else
+    info "  ? mergeability $merge"
+  fi
+
+  if is_submitted "$id"; then
+    info "  ✓ submission marker present"
+  else
+    info "  ✗ not submitted"
+  fi
+
+  # Optional package checks (off by default — heavy on small hosts)
+  if [[ "${SWARM_RUN_CHECKS:-0}" == "1" ]]; then
+    info ""
+    info "Package checks (SWARM_RUN_CHECKS=1):"
+    if [[ -f "$wt/package.json" ]] && command -v pnpm >/dev/null 2>&1; then
+      set +e
+      (cd "$wt" && pnpm -r --filter './packages/**' exec true) >/dev/null 2>&1
+      info "  (set filters yourself; no default full-repo typecheck — host memory)"
+      set -e
+      info "  · skipped heavy typecheck/lint/test by default"
+    else
+      info "  · no pnpm package.json or pnpm missing"
+    fi
+  else
+    info "  · package typecheck/lint/test not run (export SWARM_RUN_CHECKS=1 to enable later)"
+  fi
+
+  info ""
+  local submitted=0
+  if is_submitted "$id"; then submitted=1; fi
+  if [[ "$dirty" == "clean" && "$merge" == "CLEAN" && "$submitted" -eq 1 && "${ahead:-0}" -gt 0 ]]; then
+    info "READY TO INTEGRATE"
+    info "  swarm integrate $id"
+    info "  then: swarm remove $id --confirm -d"
+  elif [[ "$merge" == "CONFLICT" ]]; then
+    info "NOT READY — hand back to agent:"
+    info "  swarm sync $id   # then agent resubmits"
+  else
+    info "NOT READY — see checks above"
+  fi
+}
+
+cmd_integrate() {
+  local msg="" id=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -m|--message) msg="${2:-}"; shift 2 ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      -*) die "unknown flag: $1" ;;
+      *) id="$1"; shift ;;
+    esac
+  done
+  [[ -n "$id" ]] || die "usage: swarm integrate <repo__work-id> [-m \"msg\"] [--dry-run]"
+
+  id="$(normalize_worktree_id "$id")"
+  parse_id "$id"
+  local wt canon branch dirty merge
+  wt="$(ensure_worktree "$id")"
+  canon="$(canonical_abs "$id")"
+  [[ -d "$canon" ]] || die "canonical missing: $canon"
+
+  is_submitted "$id" || die "no submission marker — agent must: swarm submit $id"
+
+  dirty="$(working_tree_state "$wt")"
+  [[ "$dirty" == "clean" ]] || die "feature worktree is dirty"
+
+  local canon_dirty
+  canon_dirty="$(working_tree_state "$canon")"
+  [[ "$canon_dirty" == "clean" ]] || die "canonical trunk is dirty — commit/stash in $canon first"
+
+  merge="$(mergeability_vs_trunk "$wt" "$canon")"
+  [[ "$merge" == "CLEAN" ]] || die "CONFLICT vs current trunk — agent must sync/resubmit"
+
+  branch="$(branch_of "$wt")"
+  [[ "$branch" != "HEAD" ]] || die "feature worktree is detached HEAD; checkout a branch before integrate"
+
+  if [[ -z "$msg" ]]; then
+    msg="${_work}: integrate ${branch}"
+  fi
+
+  if dry_run_exit "in $canon: git merge --no-ff $branch -m \"$msg\"; clear $SUBMISSIONS_DIR/$id"; then
+    return 0
+  fi
+
+  info "merging $branch into canonical $(basename "$canon") (--no-ff) …"
+  git -C "$canon" merge --no-ff "$branch" -m "$msg"
+
+  clear_submission "$id"
+
+  info ""
+  info "Integrated into $canon (merge commit; feature ancestry preserved)"
+  info "Next: swarm remove $id --confirm -d"
+  info "Note: orchestrator submodule pointer is YOUR responsibility if you publish this trunk tip."
+}
+
+# True if branch must never be deleted by swarm remove -d
+is_protected_branch() {
+  local repo="$1" branch="$2"
+  local canon trunk_branch
+  canon="$REPOS_DIR/$repo"
+  case "$branch" in
+    main|master|HEAD|"") return 0 ;;
+  esac
+  if [[ -d "$canon" ]]; then
+    trunk_branch="$(git -C "$canon" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    if [[ -n "$trunk_branch" && "$trunk_branch" != "HEAD" && "$branch" == "$trunk_branch" ]]; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+cmd_remove() {
+  local delete_branch=0 confirm=0 arg=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --confirm) confirm=1; shift ;;
+      -d) delete_branch=1; shift ;;
+      -D|--force|-f)
+        die "swarm remove does not support force-delete (-D/--force); use --confirm [-d]"
+        ;;
+      --dry-run)
+        die "remove does not support --dry-run; use: swarm remove <id> --confirm [-d]"
+        ;;
+      -*) die "unknown flag: $1" ;;
+      *) arg="$1"; shift ;;
+    esac
+  done
+  [[ -n "$arg" ]] || die "usage: swarm remove <repo__work-id> --confirm [-d]"
+  [[ "$confirm" -eq 1 ]] || die "refusing remove without --confirm
+  usage: swarm remove <repo__work-id> --confirm [-d]"
+
+  local id wt canon repo_path branch
+  id="$(normalize_worktree_id "$arg")"
+  parse_id "$id"
+  repo_path="$(canonical_abs "$id")"
+  wt="$(worktree_abs "$id")"
+  [[ -d "$wt" ]] || die "worktree not found: $wt"
+  [[ -d "$repo_path" ]] || die "canonical repo missing: $repo_path"
+
+  branch="$(branch_of "$wt" 2>/dev/null || echo "HEAD")"
+
+  if [[ "$delete_branch" -eq 1 ]]; then
+    if is_protected_branch "$_repo" "$branch"; then
+      die "refusing -d: '$branch' is a protected/trunk branch
+  remove the worktree without -d, or use a feature branch"
+    fi
+  fi
+
+  info "Will remove:"
+  info "  worktree:   $wt"
+  info "  submission: $SUBMISSIONS_DIR/$id (if present)"
+  if [[ "$delete_branch" -eq 1 ]]; then
+    info "  branch:     $branch  (git branch -d after worktree remove)"
+  else
+    info "  branch:     $branch  (kept; pass -d to delete if merged)"
+  fi
+  info ""
+  printf 'Type Y to confirm removal: ' >&2
+  local answer=""
+  if [[ ! -t 0 ]]; then
+    die "remove requires an interactive terminal to confirm (stdin is not a TTY)"
+  fi
+  read -r answer
+  [[ "$answer" == "Y" ]] || die "aborted (expected exactly Y)"
+
+  clear_submission "$id"
+
+  info "removing worktree $wt"
+  if ! git -C "$repo_path" worktree remove "$wt"; then
+    die "git worktree remove failed (is the worktree dirty? commit/stash, then retry)
+  branch left intact: $branch"
+  fi
+
+  git -C "$repo_path" worktree prune
+
+  if [[ "$delete_branch" -eq 1 ]]; then
+    info "deleting local branch $branch (git branch -d) …"
+    set +e
+    git -C "$repo_path" branch -d "$branch"
+    local rc=$?
+    set -e
+    if [[ $rc -ne 0 ]]; then
+      warn "git branch -d failed — branch '$branch' was NOT deleted (not fully merged or still in use)"
+      warn "worktree and submission marker were already removed"
+      return 1
+    fi
+    info "deleted local branch $branch"
+  fi
+
+  info "done (remote branch left untouched)"
+}
+
+# ---------------------------------------------------------------------------
+# install
+# ---------------------------------------------------------------------------
+
+os_is_debian_family() {
+  [[ -f /etc/os-release ]] || return 1
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  case "${ID:-}:${ID_LIKE:-}" in
+    debian:*|ubuntu:*|*:debian*|*:ubuntu*) return 0 ;;
+  esac
+  return 1
+}
+
+ensure_jq_dependency() {
+  info "Dependencies"
+  if command -v jq >/dev/null 2>&1; then
+    info "  ✓ jq already installed ($(jq --version 2>/dev/null | head -1))"
+    return 0
+  fi
+  if ! os_is_debian_family; then
+    die "jq is required by Swarm.
+
+Automatic dependency installation is currently supported on Ubuntu/Debian only.
+Install jq manually and rerun \`swarm install\`."
+  fi
+  info "  · installing jq via apt-get …"
+  sudo apt-get update
+  sudo apt-get install -y jq
+  command -v jq >/dev/null 2>&1 \
+    || die "jq installation appeared to succeed but jq is not on PATH"
+  info "  ✓ jq installed ($(jq --version 2>/dev/null | head -1))"
+}
+
+ensure_gitignore_swarm_entry() {
+  local gi="$SWARM_ROOT/.gitignore"
+  if [[ -f "$gi" ]] && grep -qE '^\.swarm/?$' "$gi" 2>/dev/null; then
+    return 0
+  fi
+  {
+    printf '\n# Swarm local runtime state\n'
+    printf '.swarm/\n'
+  } >>"$gi"
+  info "  ✓ appended .swarm/ to .gitignore"
+}
+
+init_new_workspace() {
+  local root
+  root="$(pwd -P)"
+  SWARM_ROOT="$root"
+  SWARM_CONFIG_PATH="$root/$SWARM_CONFIG_NAME"
+
+  if [[ ! -t 0 ]]; then
+    die "No Swarm workspace found under $root or any parent.
+
+stdin is non-interactive; refusing to initialize automatically.
+Run \`swarm install\` from a terminal to configure this directory, or create swarm.json manually."
+  fi
+
+  info ""
+  info "No Swarm workspace found."
+  info ""
+  printf 'Configure %s as a new Swarm root? [Y/n]: ' "$root" >&2
+  local answer=""
+  read -r answer || true
+  case "${answer:-Y}" in
+    ''|Y|y|yes|YES|Yes) ;;
+    n|N|no|NO|No)
+      info "Swarm installation cancelled. No workspace files were created."
+      exit 0
+      ;;
+    *)
+      die "unrecognized answer '$answer' (expected Y or n)"
+      ;;
+  esac
+
+  info ""
+  info "Workspace"
+  cat >"$SWARM_CONFIG_PATH" <<'EOF'
+{
+  "version": 1,
+  "repos_dir": ".",
+  "state_dir": ".swarm",
+  "repos": []
+}
+EOF
+  info "  ✓ created swarm.json"
+
+  cat >"$SWARM_ROOT/swarm.md" <<'EOF'
+# Swarm Workspace Instructions
+
+Add workspace-specific instructions for agents here.
+
+Examples:
+
+- work-management or MCP tools agents should use
+- repository-specific development conventions
+- feature/specification documentation requirements
+- host-specific build and test constraints
+
+Do not duplicate machine configuration from `swarm.json` or universal Swarm behavior from the Swarm skill.
+EOF
+  info "  ✓ created swarm.md"
+
+  mkdir -p "$SWARM_ROOT/.swarm/submissions"
+  if [[ ! -f "$SWARM_ROOT/.swarm/.gitignore" ]]; then
+    printf '*\n!.gitignore\n' >"$SWARM_ROOT/.swarm/.gitignore"
+  fi
+  ensure_gitignore_swarm_entry
+  info "  ✓ Swarm root: $SWARM_ROOT"
+}
+
+install_skill_copy() {
+  # $1 = relative dest under SWARM_ROOT e.g. .cursor/skills/swarm
+  # $2 = label e.g. Cursor
+  local rel="$1" label="$2"
+  local dest="$SWARM_ROOT/$rel"
+  local dest_skill="$dest/SKILL.md"
+
+  [[ -f "$SKILL_TEMPLATE" ]] || die "canonical skill template missing: $SKILL_TEMPLATE"
+
+  if [[ -e "$dest" && ! -d "$dest" ]]; then
+    die "error: $label already has a different Swarm skill at:
+
+  $dest
+
+Remove or resolve it manually before rerunning installation."
+  fi
+
+  if [[ -f "$dest_skill" ]]; then
+    info "  ✓ $label skill already installed"
+    return 0
+  fi
+
+  mkdir -p "$dest"
+  cp "$SKILL_TEMPLATE" "$dest_skill"
+  info "  ✓ $label $rel"
+}
+
+# Managed PATH block markers in ~/.bashrc (owned exclusively by Swarm).
+SWARM_BASHRC_START='# <-- swarm:start -->'
+SWARM_BASHRC_END='# <-- swarm:end -->'
+
+swarm_bashrc_path() {
+  printf '%s\n' "${HOME}/.bashrc"
+}
+
+swarm_path_export_line() {
+  printf 'export PATH="%s:$PATH"' "$CLI_DIR"
+}
+
+# True if `command -v swarm` resolves to this checkout's executable.
+swarm_resolves_to_this_checkout() {
+  local found real_found real_self
+  found="$(command -v swarm 2>/dev/null)" || return 1
+  real_found="$(readlink -f "$found" 2>/dev/null || printf '%s' "$found")"
+  real_self="$(readlink -f "$CLI_DIR/swarm")"
+  [[ "$real_found" == "$real_self" ]]
+}
+
+# Count fixed-string matches in a file (0 if missing / no matches).
+count_fixed_matches() {
+  local needle="$1" file="$2" n
+  [[ -f "$file" ]] || { printf '0\n'; return 0; }
+  n="$(grep -cF -- "$needle" "$file" 2>/dev/null || true)"
+  printf '%s\n' "${n:-0}"
+}
+
+# Validate managed markers. Sets:
+#   _SWARM_BASHRC_STATE = none|present|malformed
+#   _SWARM_BASHRC_START_LINE / _SWARM_BASHRC_END_LINE when present
+# Prints a human reason on malformed (via _SWARM_BASHRC_REASON).
+inspect_swarm_bashrc_block() {
+  local file="$1"
+  _SWARM_BASHRC_STATE="none"
+  _SWARM_BASHRC_REASON=""
+  _SWARM_BASHRC_START_LINE=0
+  _SWARM_BASHRC_END_LINE=0
+
+  if [[ ! -f "$file" ]]; then
+    return 0
+  fi
+
+  local start_count end_count
+  start_count="$(count_fixed_matches "$SWARM_BASHRC_START" "$file")"
+  end_count="$(count_fixed_matches "$SWARM_BASHRC_END" "$file")"
+
+  if [[ "$start_count" -eq 0 && "$end_count" -eq 0 ]]; then
+    _SWARM_BASHRC_STATE="none"
+    return 0
+  fi
+
+  if [[ "$start_count" -ne 1 || "$end_count" -ne 1 ]]; then
+    _SWARM_BASHRC_STATE="malformed"
+    _SWARM_BASHRC_REASON="expected exactly one '$SWARM_BASHRC_START' and one '$SWARM_BASHRC_END' (found start=$start_count end=$end_count)"
+    return 0
+  fi
+
+  _SWARM_BASHRC_START_LINE="$(grep -nF -- "$SWARM_BASHRC_START" "$file" | head -1 | cut -d: -f1)"
+  _SWARM_BASHRC_END_LINE="$(grep -nF -- "$SWARM_BASHRC_END" "$file" | head -1 | cut -d: -f1)"
+
+  if [[ "$_SWARM_BASHRC_START_LINE" -ge "$_SWARM_BASHRC_END_LINE" ]]; then
+    _SWARM_BASHRC_STATE="malformed"
+    _SWARM_BASHRC_REASON="start marker must appear before end marker (start=line $_SWARM_BASHRC_START_LINE end=line $_SWARM_BASHRC_END_LINE)"
+    return 0
+  fi
+
+  _SWARM_BASHRC_STATE="present"
+}
+
+die_malformed_bashrc_block() {
+  local file="$1"
+  die "Refusing to modify $file: Swarm-managed PATH block is malformed.
+
+$_SWARM_BASHRC_REASON
+
+Swarm only edits the region between:
+  $SWARM_BASHRC_START
+  $SWARM_BASHRC_END
+
+Fix or remove the broken markers manually, then rerun \`swarm install --path\`."
+}
+
+# Write managed block into bashrc: append if none, else replace existing block only.
+write_swarm_bashrc_block() {
+  local file="$1"
+  local export_line="$2"
+  local tmp
+  tmp="$(mktemp)"
+
+  inspect_swarm_bashrc_block "$file"
+  case "$_SWARM_BASHRC_STATE" in
+    malformed)
+      rm -f "$tmp"
+      die_malformed_bashrc_block "$file"
+      ;;
+    none)
+      rm -f "$tmp"
+      if [[ -f "$file" && -s "$file" ]]; then
+        # Ensure a separating newline before the managed block.
+        local last_char
+        last_char="$(tail -c 1 "$file" 2>/dev/null || true)"
+        if [[ -n "$last_char" && "$last_char" != $'\n' ]]; then
+          printf '\n' >>"$file"
+        fi
+        printf '\n' >>"$file"
+      else
+        mkdir -p "$(dirname "$file")"
+        : >"$file"
+      fi
+      {
+        printf '%s\n' "$SWARM_BASHRC_START"
+        printf '%s\n' "$export_line"
+        printf '%s\n' "$SWARM_BASHRC_END"
+      } >>"$file"
+      ;;
+    present)
+      {
+        if [[ "$_SWARM_BASHRC_START_LINE" -gt 1 ]]; then
+          head -n "$((_SWARM_BASHRC_START_LINE - 1))" "$file"
+        fi
+        printf '%s\n' "$SWARM_BASHRC_START"
+        printf '%s\n' "$export_line"
+        printf '%s\n' "$SWARM_BASHRC_END"
+        tail -n "+$((_SWARM_BASHRC_END_LINE + 1))" "$file"
+      } >"$tmp"
+      # Replace file contents with reconstructed text (outside the managed
+      # markers is preserved byte-for-byte via head/tail). Never write a
+      # blank/replacement bashrc that drops user content.
+      cat "$tmp" >"$file"
+      rm -f "$tmp"
+      ;;
+  esac
+}
+
+# Extract interior of managed block (lines strictly between markers) to stdout.
+read_swarm_bashrc_block_interior() {
+  local file="$1"
+  inspect_swarm_bashrc_block "$file"
+  [[ "$_SWARM_BASHRC_STATE" == "present" ]] || return 1
+  local start="$_SWARM_BASHRC_START_LINE" end="$_SWARM_BASHRC_END_LINE"
+  if [[ "$((end - start))" -le 1 ]]; then
+    return 0
+  fi
+  sed -n "$((start + 1)),$((end - 1))p" "$file"
+}
+
+prompt_yes_default() {
+  # $1 = prompt text; returns 0 for yes, 1 for no; dies on unrecognized / non-TTY.
+  local prompt="$1"
+  local answer=""
+  if [[ ! -t 0 ]]; then
+    die "stdin is non-interactive; refusing to modify shell configuration automatically.
+Run \`swarm install --path\` from a terminal."
+  fi
+  printf '%s' "$prompt" >&2
+  read -r answer || true
+  case "${answer:-Y}" in
+    ''|Y|y|yes|YES|Yes) return 0 ;;
+    n|N|no|NO|No) return 1 ;;
+    *) die "unrecognized answer '$answer' (expected Y or n)" ;;
+  esac
+}
+
+install_path_registration() {
+  info "PATH"
+
+  [[ -n "${BASH_VERSION:-}" ]] \
+    || die "PATH installation currently supports Bash only (BASH_VERSION is unset).
+
+Add the Swarm checkout to PATH manually, or rerun from Bash."
+
+  case "${SHELL:-}" in
+    ''|*/bash) ;;
+    *)
+      die "PATH installation currently supports Bash only (SHELL=${SHELL}).
+
+Swarm manages a block in ~/.bashrc and will not edit other shell rc files."
+      ;;
+  esac
+
+  local bashrc export_line
+  bashrc="$(swarm_bashrc_path)"
+  export_line="$(swarm_path_export_line)"
+
+  info "  · executable: $CLI_DIR/swarm"
+  info "  · target:     $bashrc"
+
+  inspect_swarm_bashrc_block "$bashrc"
+  case "$_SWARM_BASHRC_STATE" in
+    malformed)
+      die_malformed_bashrc_block "$bashrc"
+      ;;
+    present)
+      local interior
+      interior="$(read_swarm_bashrc_block_interior "$bashrc" || true)"
+      if [[ "$interior" == "$export_line" ]]; then
+        info "  ✓ managed PATH block already points at this checkout"
+        return 0
+      fi
+      write_swarm_bashrc_block "$bashrc" "$export_line"
+      info "  ✓ updated managed PATH block"
+      info "  · run: source $bashrc"
+      return 0
+      ;;
+    none)
+      if swarm_resolves_to_this_checkout; then
+        info "  · Swarm already resolves to this checkout on PATH"
+      else
+        info "  · Swarm is not currently on your PATH"
+      fi
+      info ""
+      if ! prompt_yes_default "Add Swarm to ~/.bashrc? [Y/n]: "; then
+        info "PATH installation cancelled. No shell configuration was changed."
+        return 0
+      fi
+      write_swarm_bashrc_block "$bashrc" "$export_line"
+      info "  ✓ wrote managed PATH block"
+      info "  · run: source $bashrc"
+      return 0
+      ;;
+  esac
+}
+
+cmd_install() {
+  local want_path=0 want_cursor=0 want_claude=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --path) want_path=1; shift ;;
+      --cursor) want_cursor=1; shift ;;
+      --claude) want_claude=1; shift ;;
+      -*) die "unknown flag: $1
+usage: swarm install [--path] [--cursor] [--claude]" ;;
+      *) die "unexpected argument: $1
+usage: swarm install [--path] [--cursor] [--claude]" ;;
+    esac
+  done
+
+  # --path alone: only manage shell PATH (do not init a workspace in the CLI checkout).
+  # Combined with --cursor/--claude: PATH plus normal workspace/skill install.
+  local path_only=0
+  if [[ "$want_path" -eq 1 && "$want_cursor" -eq 0 && "$want_claude" -eq 0 ]]; then
+    path_only=1
+  fi
+
+  info "Swarm installation"
+  info ""
+
+  if [[ "$want_path" -eq 1 ]]; then
+    install_path_registration
+    if [[ "$path_only" -eq 1 ]]; then
+      info ""
+      info "Swarm PATH installation complete."
+      return 0
+    fi
+    info ""
+  fi
+
+  ensure_jq_dependency
+  info ""
+
+  if try_find_swarm_config; then
+    info "Workspace"
+    info "  ✓ $SWARM_ROOT"
+    load_swarm_config_from_path
+    info "  ✓ swarm.json valid"
+  else
+    init_new_workspace
+    load_swarm_config_from_path
+  fi
+
+  if [[ "$want_cursor" -eq 1 || "$want_claude" -eq 1 ]]; then
+    info ""
+    info "Skills"
+    if [[ "$want_cursor" -eq 1 ]]; then
+      install_skill_copy ".cursor/skills/swarm" "Cursor"
+    fi
+    if [[ "$want_claude" -eq 1 ]]; then
+      install_skill_copy ".claude/skills/swarm" "Claude"
+    fi
+  fi
+
+  info ""
+  info "Swarm ready."
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+
+  case "$cmd" in
+    help|-h|--help)
+      usage
+      return 0
+      ;;
+    version|--version)
+      info "swarm $SWARM_VERSION"
+      return 0
+      ;;
+    install)
+      cmd_install "$@"
+      return 0
+      ;;
+  esac
+
+  load_swarm_config
+
+  # Global --dry-run anywhere in argv for write commands (not remove)
+  case "$cmd" in
+    create|sync|submit|integrate)
+      consume_dry_run_args "$@"
+      set -- "${_ARGS[@]+"${_ARGS[@]}"}"
+      ;;
+  esac
+
+  case "$cmd" in
+    config) cmd_config "$@" ;;
+    create) cmd_create "$@" ;;
+    list|ls) cmd_list "$@" ;;
+    check) cmd_check "$@" ;;
+    sync) cmd_sync "$@" ;;
+    submit) cmd_submit "$@" ;;
+    review) cmd_review "$@" ;;
+    integrate) cmd_integrate "$@" ;;
+    remove|rm) cmd_remove "$@" ;;
+    *)
+      usage >&2
+      die "unknown command: $cmd"
+      ;;
+  esac
+}
+
+main "$@"

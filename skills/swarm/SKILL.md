@@ -1,0 +1,174 @@
+---
+name: swarm
+description: >-
+  Manage parallel development work using Swarm worktrees, submissions, review,
+  and integration. Bootstrap with `swarm config`.
+---
+
+# Swarm
+
+Use this skill whenever work may occur concurrently with another developer or
+agent in the same component repository.
+
+## Bootstrap
+
+When beginning work in a Swarm workspace, run:
+
+```bash
+swarm config
+```
+
+Use its resolved Swarm configuration and workspace instructions as
+authoritative. Do not independently infer workspace paths or duplicate
+configuration discovery.
+
+`swarm config` walks up from `$PWD` to the nearest `swarm.json` (same
+resolution as every other Swarm command). Optional `<SWARM_ROOT>/swarm.md`
+holds workspace-specific instructions only.
+
+```text
+SKILL.md     universal Swarm protocol (this file)
+swarm.json   workspace topology (machine-readable)
+swarm.md     optional workspace-specific instructions
+```
+
+**CLI hygiene:** Prefer read-only commands (`config`, `list`, `check`,
+`review`). For writes (`create`, `sync`, `submit`, `integrate`), pass
+`--dry-run` first unless the user explicitly asked you to apply the change.
+`remove` requires `--confirm` and interactive `Y` (optional `-d` for
+`git branch -d` only).
+
+## Principle
+
+The canonical repository checkout is **not** an agent development workspace.
+**You own only your worktree.** The human integrator owns the canonical trunk,
+integration, and cleanup.
+
+```text
+Agents:   create · list · check · sync · submit
+Human:    list · review · integrate · remove
+```
+
+Parallel work occurs in Git worktrees managed by `swarm`.
+
+One unit of work maps to:
+
+- one branch
+- one worktree (`<repos_dir>/<repo>__<work-id>/`)
+- optionally one **submission marker** (`<state_dir>/submissions/<repo>__<work-id>`)
+
+Worktrees are ephemeral. Branches exist only for the lifetime of active work.
+
+## Naming
+
+Preferred worktree naming:
+
+    <repos_dir>/<repo>__<ticket-id>
+
+Examples (with default `repos_dir: services`):
+
+    services/ts-mono__2680
+    services/gds__2711
+
+Ticket IDs are strongly preferred but not mandatory. When no ticket exists,
+use a short stable work identifier:
+
+    services/ts-mono__billing-cleanup
+
+Never create arbitrary alternate worktree directory structures.
+
+## Starting Work
+
+Do not develop in the canonical checkout when parallel work is expected.
+
+    swarm create <repo> <work-id> [branch]
+
+If the worktree already exists, reuse it. Do not create another branch or
+worktree for the same unit of work.
+
+## During Work
+
+Commit freely on the assigned feature branch. Feature-branch history is
+disposable implementation history until integrated with `--no-ff`.
+
+- Do not modify another worktree.
+- Do not change the orchestrator’s tracked submodule pointer.
+- Do not force-push under normal operation.
+- Do not rebase merely because the branch is behind main.
+
+Use:
+
+    swarm check <repo__work-id>
+
+to see dirty/conflict/submit readiness against **current trunk**.
+
+## Synchronizing Trunk
+
+Being behind trunk is not itself a problem.
+
+If mergeability is still clean, continue without syncing.
+
+When sync is required (especially after `check`/`review` reports CONFLICT):
+
+    swarm sync <repo__work-id>
+
+This merges the integration base into the feature branch and **clears** any
+submission marker. Resolve conflicts, test, commit, then submit again.
+
+Do not routinely rebase.
+
+## Submitting (inbox, not a queue)
+
+When the unit of work is ready for the human integrator:
+
+    swarm submit <repo__work-id>
+
+Requires a clean worktree and clean mergeability vs current canonical trunk.
+This only `touch`es `<state_dir>/submissions/<repo>__<work-id>` (usually
+`.swarm/submissions/…`).
+
+Do **not** open a PR as the primary integration path for swarm work unless the
+human asks. The human reviews and integrates locally from the submission inbox.
+
+After submit, stop modifying that worktree unless asked to sync/fix conflicts.
+
+## NEVER RUN (agents)
+
+```text
+swarm integrate …
+swarm remove …
+```
+
+Only the human trunk manager integrates into the canonical checkout and removes
+worktrees/branches. `integrate` uses `git merge --no-ff` (ancestry preserved).
+`remove` requires `--confirm` and an interactive `Y`; optional `-d` runs
+`git branch -d` only (never `-D` / `--force`).
+
+## Completion lifecycle
+
+```text
+create → work → commit → check → submit
+                              ↓
+                     human: review → integrate → remove
+```
+
+If the human integrates something else first and your submission later shows
+CONFLICT on review, they will hand it back. Then:
+
+    swarm sync <repo__work-id>
+    # resolve, commit
+    swarm submit <repo__work-id>
+
+## Safety Invariants
+
+Never:
+
+- work on another agent's branch without explicit instruction
+- run `integrate` or `remove`
+- delete an unmerged worktree or branch
+- force-push as routine synchronization
+- rebase merely to catch up with main
+- use the canonical checkout as an ephemeral agent workspace
+- modify the orchestrator’s tracked submodule revision as a side effect
+
+When state is ambiguous, stop before destructive Git operations.
