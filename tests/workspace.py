@@ -193,7 +193,7 @@ class Workspace(unittest.TestCase):
         self.assertEqual(json.loads((self.root / '.swarm/migration-v1/config.json').read_text()), config)
         ignore = (self.root / '.gitignore').read_text()
         self.assertNotIn('*__*/', ignore)
-        self.assertIn('/services/api__active/', ignore)
+        self.assertNotIn('/services/api__active/', ignore)
         self.assertIn('user-rule', ignore); self.assertIn('after-rule', ignore)
         self.assertIn('Already version 2', self.runcli('migrate').stdout)
         self.runcli('check', 'api__active')  # retained legacy selector
@@ -231,7 +231,7 @@ class Workspace(unittest.TestCase):
         self.assertTrue((self.root / '.swarm/submissions/services/api__active').is_file())
         self.assertTrue((self.root / '.swarm/submissions/services/gone__orphan').is_file())
         self.assertTrue((inbox / '2026-10-14-001__api__active').is_file())
-        self.assertIn('/runtime/state/', gi.read_text())
+        self.assertNotIn('/runtime/state/', gi.read_text())
         self.assertIn('ORPHAN', self.runcli('status').stdout)
         self.runcli('check', str(wt))
         self.runcli('add', '.', cwd=repo)

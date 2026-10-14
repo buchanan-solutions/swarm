@@ -200,34 +200,7 @@ resolve_repo_selector() {
   return 1
 }
 
-# Keep only precise ignores for legacy worktrees; never hide unrelated __ dirs.
-gitignore_literal() {
-  local text="$1"
-  text="${text//\\/\\\\}"; text="${text//\*/\\*}"
-  text="${text//\?/\\?}"; text="${text//\[/\\[}"
-  text="${text// /\\ }"
-  printf '/%s/\n' "$text"
-}
-
+# Swarm owns one fixed runtime directory; no legacy checkout ignore rules.
 workspace_ignore_rules() {
   printf '# Swarm local state and worktrees\n.swarm/\n'
-  if [[ "$CONFIG_VERSION" == 1 ]]; then
-    printf '\n# Legacy sibling worktrees (run swarm migrate to use precise rules)\n*__*/\n'
-    return
-  fi
-  local repo path legacy_state
-  if [[ -f "$STATE_DIR/migration-v1/config.json" ]]; then
-    legacy_state="$(jq -r '.state_dir' "$STATE_DIR/migration-v1/config.json")"
-    if [[ "$legacy_state" == . ]]; then
-      gitignore_literal submissions; gitignore_literal sizes
-    elif [[ "$legacy_state" != .swarm ]]; then gitignore_literal "$legacy_state"; fi
-  fi
-  for repo in "${REPOS_LIST[@]}"; do
-    while IFS= read -r path; do
-      path="${path#worktree }"
-      if [[ "$path" == "$REPOS_DIR/${repo}__"* ]]; then
-        gitignore_literal "${path#"$SWARM_ROOT"/}"
-      fi
-    done < <(git -C "$REPOS_DIR/$repo" worktree list --porcelain 2>/dev/null | sed -n '/^worktree /p')
-  done
 }

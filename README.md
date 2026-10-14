@@ -170,9 +170,9 @@ an error instead of silently creating another checkout.
 
 Active submissions are copied to their version 2 identities. Original config and
 submission snapshots are retained in `.swarm/migration-v1/`. Custom old state
-directories are retained. Swarm's managed ignore block switches to `.swarm/` plus
-precise entries for existing legacy checkouts and any old custom state directory;
-user-owned rules are preserved. Repeating migration is safe. Legacy repo selectors
+directories are retained. Swarm's managed ignore block contains only `.swarm/`;
+no legacy checkout or custom-state ignore entries are retained. User-owned rules
+outside the managed block are preserved. Repeating migration is safe. Legacy repo selectors
 such as `ts-mono__1234` remain accepted after migration when unambiguous.
 
 ### `swarm.md`

@@ -244,5 +244,6 @@ properties, and fixes local state at `.swarm`. Existing worktrees remain in plac
 new worktrees use `.swarm/worktrees/<repo-path>__<work-id>`. Active submissions and
 project instructions are preserved. Original config and inbox snapshots are kept
 under `.swarm/migration-v1/`. Old custom state directories are retained.
-The managed ignore block keeps exact ignores for old checkouts while removing
-Swarm's broad `*__*/` rule. User-owned rules are preserved.
+The managed ignore block contains only `.swarm/`; Swarm's broad `*__*/` rule
+and legacy-path ignore entries are removed. User-owned rules outside that block
+are preserved.
