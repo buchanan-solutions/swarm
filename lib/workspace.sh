@@ -22,9 +22,10 @@ cmd_add() {
   path="$(realpath -e -- "$1")" || die "path does not exist: $1"
   is_checkout_root "$path" || die "not a Git checkout root: $path"
   require_main_checkout "$path"
-  [[ "$path" == "$REPOS_DIR/"* ]] || die "repo must be beneath repos_dir: $REPOS_DIR"
+  [[ "$path" == "$REPOS_DIR/"* ]] || die "repo must be beneath the workspace repo root: $REPOS_DIR"
   repo="${path#"$REPOS_DIR"/}"
   validate_repo_name "$repo"
+  [[ "$CONFIG_VERSION" != 2 || "$repo" != .swarm && "$repo" != .swarm/* ]] || die "cannot register a repo inside Swarm state"
   if repo_authorized "$repo"; then
     info "Already registered: $repo"
     return
@@ -126,8 +127,7 @@ status_tables() {
           kind=EXTERNAL; id=""
           if [[ "$wt" == "$canon" ]]; then kind=CANONICAL
           else count=$((count+1)); fi
-          if [[ "$wt" == "$canon"__* ]]; then
-            id="${wt#"$REPOS_DIR"/}"
+          if id="$(managed_id_for_path "$repo" "$wt")"; then
             kind=ACTIVE
             seen+=("$id")
           fi
@@ -139,7 +139,7 @@ status_tables() {
           size=unknown
           if [[ "$list_only" != 1 && "$record" != MISSING/INVALID ]]; then size="$(checkout_size "$wt" "$scan" "$refresh")"; fi
           if [[ "$list_only" != 1 || -n "$id" ]]; then
-            details+=("$repo"$'\t'"${wt#"$REPOS_DIR"/}"$'\t'"$branch"$'\t'"$dirty"$'\t'"$kind"$'\t'"$record"$'\t'"$size")
+            details+=("$repo"$'\t'"${wt#"$SWARM_ROOT"/}"$'\t'"$branch"$'\t'"$dirty"$'\t'"$kind"$'\t'"$record"$'\t'"$size")
           fi
           wt="" ;;
       esac
@@ -177,6 +177,7 @@ cmd_status() {
     shift
   done
   if [[ -n "$selected" ]]; then
+    selected="$(resolve_repo_selector "$selected")"
     if ! repo_authorized "$selected"; then
       local resolved
       resolved="$(realpath -m "$selected")"
@@ -185,4 +186,48 @@ cmd_status() {
     repo_authorized "$selected" || die "repo not registered: $selected"
   fi
   status_tables "$selected" "$scan" "$refresh"
+}
+
+resolve_repo_selector() {
+  local arg="$1" resolved
+  if repo_authorized "$arg"; then printf '%s' "$arg"; return; fi
+  if [[ -n "$LEGACY_REPOS_PREFIX" ]] && repo_authorized "$LEGACY_REPOS_PREFIX/$arg"; then
+    printf '%s/%s' "$LEGACY_REPOS_PREFIX" "$arg"; return
+  fi
+  resolved="$(realpath -m "$arg")"
+  arg="${resolved#"$REPOS_DIR"/}"
+  if repo_authorized "$arg"; then printf '%s' "$arg"; return; fi
+  return 1
+}
+
+# Keep only precise ignores for legacy worktrees; never hide unrelated __ dirs.
+gitignore_literal() {
+  local text="$1"
+  text="${text//\\/\\\\}"; text="${text//\*/\\*}"
+  text="${text//\?/\\?}"; text="${text//\[/\\[}"
+  text="${text// /\\ }"
+  printf '/%s/\n' "$text"
+}
+
+workspace_ignore_rules() {
+  printf '# Swarm local state and worktrees\n.swarm/\n'
+  if [[ "$CONFIG_VERSION" == 1 ]]; then
+    printf '\n# Legacy sibling worktrees (run swarm migrate to use precise rules)\n*__*/\n'
+    return
+  fi
+  local repo path legacy_state
+  if [[ -f "$STATE_DIR/migration-v1/config.json" ]]; then
+    legacy_state="$(jq -r '.state_dir' "$STATE_DIR/migration-v1/config.json")"
+    if [[ "$legacy_state" == . ]]; then
+      gitignore_literal submissions; gitignore_literal sizes
+    elif [[ "$legacy_state" != .swarm ]]; then gitignore_literal "$legacy_state"; fi
+  fi
+  for repo in "${REPOS_LIST[@]}"; do
+    while IFS= read -r path; do
+      path="${path#worktree }"
+      if [[ "$path" == "$REPOS_DIR/${repo}__"* ]]; then
+        gitignore_literal "${path#"$SWARM_ROOT"/}"
+      fi
+    done < <(git -C "$REPOS_DIR/$repo" worktree list --porcelain 2>/dev/null | sed -n '/^worktree /p')
+  done
 }

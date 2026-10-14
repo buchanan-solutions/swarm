@@ -3,7 +3,7 @@
 # Prefer ./swarm/swarm for agent/human workflows. Not a public CLI.
 set -euo pipefail
 
-WP_VERSION="0.2.0"
+WP_VERSION="0.3.0"
 
 # ---------------------------------------------------------------------------
 # Paths / config
@@ -24,6 +24,7 @@ wp_deploy_root() {
 DEPLOY_ROOT="$(wp_deploy_root)"
 SERVICES_DIR="${WP_SERVICES_DIR:-$DEPLOY_ROOT/services}"
 # Integration base for status/sync/gc. Override with WP_BASE_REF=origin/eos etc.
+WORKTREES_DIR="${WP_WORKTREES_DIR:-$SERVICES_DIR}"
 BASE_REF="${WP_BASE_REF:-origin/main}"
 DRY_RUN=0
 
@@ -105,7 +106,7 @@ canonical_repo_path() {
 
 worktree_path_for() {
   local repo="$1" work_id="$2"
-  printf '%s\n' "$SERVICES_DIR/${repo}__${work_id}"
+  resolve_managed_worktree "$repo" "$work_id" "$SERVICES_DIR" "$WORKTREES_DIR"
 }
 
 # Parse user arg into absolute worktree path.
@@ -144,7 +145,8 @@ parse_repo_work_from_path() {
   # Sets: _repo _work_id from .../repo__work-id
   local path="$1"
   local base
-  base="${path#"$SERVICES_DIR"/}"
+  if [[ "$path" == "$WORKTREES_DIR/"* ]]; then base="${path#"$WORKTREES_DIR"/}"
+  else base="${path#"$SERVICES_DIR"/}"; fi
   [[ "$base" == *"__"* ]] || die "path is not a WP worktree (expected <repo>__<work-id>): $path"
   _repo="${base%%__*}"
   _work_id="${base#*__}"
@@ -400,7 +402,7 @@ $usage_create"
 
   local repo_path wt_path
   repo_path="$(canonical_repo_path "$repo")"
-  wt_path="$(worktree_path_for "$repo" "$work_id")"
+  wt_path="${WP_TARGET_WORKTREE:-$(worktree_path_for "$repo" "$work_id")}"
 
   if [[ -z "$branch" ]]; then
     branch="task/${work_id}"

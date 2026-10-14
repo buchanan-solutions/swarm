@@ -3,9 +3,12 @@
 # Config: swarm.json (walk up from $PWD). Skill template: swarm/skills/swarm/SKILL.md
 set -euo pipefail
 
-SWARM_VERSION="0.2.0"
+SWARM_VERSION="0.3.0"
 SWARM_CONFIG_NAME="swarm.json"
-SUPPORTED_CONFIG_VERSION=1
+SUPPORTED_CONFIG_VERSION=2
+CONFIG_VERSION=""
+WORKTREES_DIR=""
+LEGACY_REPOS_PREFIX=""
 
 # Set by load_swarm_config (except help/version/install bootstrap)
 SWARM_ROOT=""
@@ -142,48 +145,33 @@ The existing Swarm workspace was not modified.
 Fix swarm.json and rerun."
   fi
 
-  local version repos_dir_rel state_dir_rel
-  version="$(jq -r '.version // empty' "$SWARM_CONFIG_PATH")"
-  [[ "$version" == "$SUPPORTED_CONFIG_VERSION" ]] \
-    || die "invalid Swarm configuration
-
-Config:
-  $SWARM_CONFIG_PATH
-
-Problem:
-  unsupported or missing version '$version' (need $SUPPORTED_CONFIG_VERSION).
-
-The existing Swarm workspace was not modified.
-Fix swarm.json and rerun."
-
-  repos_dir_rel="$(jq -r '.repos_dir // empty' "$SWARM_CONFIG_PATH")"
-  state_dir_rel="$(jq -r '.state_dir // empty' "$SWARM_CONFIG_PATH")"
-  [[ -n "$repos_dir_rel" ]] || die "invalid Swarm configuration
-
-Config:
-  $SWARM_CONFIG_PATH
-
-Problem:
-  \"repos_dir\" must be a string.
-
-The existing Swarm workspace was not modified.
-Fix swarm.json and rerun."
-  [[ -n "$state_dir_rel" ]] || die "invalid Swarm configuration
-
-Config:
-  $SWARM_CONFIG_PATH
-
-Problem:
-  \"state_dir\" must be a string.
-
-The existing Swarm workspace was not modified.
-Fix swarm.json and rerun."
-
-  REPOS_DIR="$(resolve_existing_under_root "$repos_dir_rel" "repos_dir")"
-  mkdir -p "$SWARM_ROOT/$state_dir_rel/submissions"
-  STATE_DIR="$(resolve_under_root "$state_dir_rel" "state_dir")"
+  local repos_dir_rel state_dir_rel
+  CONFIG_VERSION="$(jq -r '.version // empty' "$SWARM_CONFIG_PATH")"
+  case "$CONFIG_VERSION" in
+    1)
+      jq -e '(.repos_dir | type) == "string" and (.state_dir | type) == "string"' "$SWARM_CONFIG_PATH" >/dev/null || die "version 1 requires repos_dir and state_dir strings"
+      repos_dir_rel="$(jq -r '.repos_dir' "$SWARM_CONFIG_PATH")"
+      state_dir_rel="$(jq -r '.state_dir' "$SWARM_CONFIG_PATH")"
+      REPOS_DIR="$(resolve_existing_under_root "$repos_dir_rel" repos_dir)"
+      STATE_DIR="$(resolve_under_root "$state_dir_rel" state_dir)"
+      WORKTREES_DIR="$REPOS_DIR"
+      warn "version 1 workspace; run swarm migrate to adopt version 2"
+      ;;
+    2)
+      jq -e 'has("repos_dir") == false and has("state_dir") == false' "$SWARM_CONFIG_PATH" >/dev/null || die "version 2 has fixed paths; remove repos_dir/state_dir or migrate a version 1 config"
+      REPOS_DIR="$SWARM_ROOT"
+      STATE_DIR="$(resolve_under_root .swarm state)"
+      WORKTREES_DIR="$(resolve_under_root .swarm/worktrees worktrees)"
+      ;;
+    *) die "unsupported config version: $CONFIG_VERSION (supported: 1, 2)" ;;
+  esac
   SUBMISSIONS_DIR="$STATE_DIR/submissions"
   mkdir -p "$SUBMISSIONS_DIR"
+  LEGACY_REPOS_PREFIX=""
+  if [[ "$CONFIG_VERSION" == 2 && -f "$STATE_DIR/migration-v1/config.json" ]]; then
+    LEGACY_REPOS_PREFIX="$(realpath -m --relative-to="$SWARM_ROOT" "$SWARM_ROOT/$(jq -r '.repos_dir' "$STATE_DIR/migration-v1/config.json")")"
+    [[ "$LEGACY_REPOS_PREFIX" != . ]] || LEGACY_REPOS_PREFIX=""
+  fi
 
   REPOS_LIST=()
   if ! jq -e '.repos | type == "array"' "$SWARM_CONFIG_PATH" >/dev/null 2>&1; then
@@ -202,6 +190,7 @@ Fix swarm.json and rerun."
   local repo path
   jq -e '.repos | all(.[]; type == "string" and (test("[\\n\\t]") | not))' "$SWARM_CONFIG_PATH" >/dev/null || die "repos must contain strings"
   while IFS= read -r repo; do
+    [[ "$CONFIG_VERSION" != 2 || "$repo" != .swarm && "$repo" != .swarm/* ]] || die "repo registration points inside Swarm state: $repo"
     path="$(safe_repo_path "$repo" "$REPOS_DIR")"
     repo_authorized "$repo" && die "duplicate registered path: $repo"
     REPOS_LIST+=("$repo")
@@ -223,6 +212,7 @@ load_swarm_config() {
 require_wp() {
   [[ -x "$WP" ]] || die "bundled wp missing/not executable: $WP"
   export WP_SERVICES_DIR="$REPOS_DIR"
+  export WP_WORKTREES_DIR="$WORKTREES_DIR"
 }
 
 # If DRY_RUN=1, print planned action and return 0 (caller returns). Else return 1.
@@ -258,6 +248,7 @@ Most other commands require swarm.json in $PWD or an ancestor (becomes SWARM_ROO
 
 Bootstrap:
   swarm init
+  swarm migrate
   swarm add <path>
   swarm install
   swarm install --path
@@ -292,7 +283,7 @@ swarm config: print resolved root, swarm.json, and swarm.md.
 Topology:   <SWARM_ROOT>/swarm.json
 Workspace:  <SWARM_ROOT>/swarm.md (optional agent instructions)
 State:      <SWARM_ROOT>/.swarm/submissions/<repo>__<work-id>
-Worktrees:  <repos_dir>/<repo>__<work-id>/
+Worktrees:  <SWARM_ROOT>/.swarm/worktrees/<repo-path>__<work-id>/
 EOF
 }
 
@@ -306,11 +297,14 @@ normalize_worktree_id() {
   arg="${arg%/}"
   if [[ "$arg" == /* ]]; then
     arg="$(realpath -m "$arg")"
-    [[ "$arg" == "$REPOS_DIR/"* ]] || die "worktree outside repos_dir: $arg"
-    arg="${arg#"$REPOS_DIR"/}"
-  else
-    arg="${arg#./}"
+    local path_id
+    for repo in "${REPOS_LIST[@]}"; do
+      if path_id="$(managed_id_for_path "$repo" "$arg")"; then printf '%s\n' "$path_id"; return; fi
+    done
+    die "not a managed worktree path: $arg"
   fi
+  arg="${arg#./}"
+  if [[ "$arg" == .swarm/worktrees/* ]]; then arg="${arg#.swarm/worktrees/}"; fi
   for repo in "${REPOS_LIST[@]}"; do
     candidate="${arg%%__*}"
     if [[ "$candidate" == "$repo" && "$arg" == *'__'* ]]; then
@@ -331,6 +325,15 @@ normalize_worktree_id() {
   if [[ "$arg" == "$(basename "$REPOS_DIR")/"* ]]; then
     normalize_worktree_id "${arg#*/}"; return
   fi
+  if [[ -n "$LEGACY_REPOS_PREFIX" && "$arg" != "$LEGACY_REPOS_PREFIX/"* ]]; then
+    local legacy_repo="${arg%%__*}"
+    if [[ "$arg" == *'__'* ]] && repo_authorized "$LEGACY_REPOS_PREFIX/$legacy_repo"; then
+      normalize_worktree_id "$LEGACY_REPOS_PREFIX/$arg"; return
+    fi
+    if [[ "$arg" == */* ]] && repo_authorized "$LEGACY_REPOS_PREFIX/${arg%/*}"; then
+      normalize_worktree_id "$LEGACY_REPOS_PREFIX/$arg"; return
+    fi
+  fi
   # Permit a basename id in the current repo, including nested checkouts.
   if [[ -n "$CURRENT_REPO" && "$arg" == "$(basename "$CURRENT_REPO")__"* ]]; then
     validate_work_id "${arg#*__}"
@@ -343,6 +346,18 @@ validate_work_id() {
   [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid work-id: $1"
 }
 
+managed_id_for_path() {
+  local repo="$1" path="$2" prefix work
+  for prefix in "$WORKTREES_DIR/${repo}__" "$REPOS_DIR/${repo}__"; do
+    if [[ "$path" == "$prefix"* ]]; then
+      work="${path#"$prefix"}"
+      [[ "$work" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 1
+      printf '%s__%s\n' "$repo" "$work"; return
+    fi
+  done
+  return 1
+}
+
 infer_current_repo() {
   local top repo common candidate
   top="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
@@ -351,7 +366,7 @@ infer_current_repo() {
   for repo in "${REPOS_LIST[@]}"; do
     candidate="$REPOS_DIR/$repo"
     if [[ "$top" == "$candidate" ]]; then printf '%s' "$repo"; return; fi
-    if [[ "$top" == "$candidate"__* ]] && is_checkout_root "$candidate" &&
+    if managed_id_for_path "$repo" "$top" >/dev/null && is_checkout_root "$candidate" &&
        [[ "$common" == "$(git -C "$candidate" rev-parse --path-format=absolute --git-common-dir)" ]]; then
       printf '%s' "$repo"; return
     fi
@@ -361,7 +376,7 @@ infer_current_repo() {
 worktree_abs() {
   local id
   id="$(normalize_worktree_id "$1")"
-  printf '%s\n' "$REPOS_DIR/$id"
+  resolve_managed_worktree "${id%%__*}" "${id#*__}" "$REPOS_DIR" "$WORKTREES_DIR"
 }
 
 canonical_abs() {
@@ -513,7 +528,7 @@ branch_of() {
 # Dashboard state for one worktree
 swarm_state() {
   local wt="$1" id
-  id="${wt#"$REPOS_DIR"/}"
+  id="$(normalize_worktree_id "$wt")"
   local dirty merge canon
   dirty="$(working_tree_state "$wt")"
   if [[ "$dirty" == "dirty" ]]; then
@@ -604,10 +619,10 @@ $usage_create"
     esac
   done
 
-  if [[ -n "$CURRENT_REPO" ]] && ! repo_authorized "${positional[0]:-}"; then
+  if [[ -n "$CURRENT_REPO" ]] && ! resolve_repo_selector "${positional[0]:-}" >/dev/null; then
     positional=("$CURRENT_REPO" "${positional[@]}")
   fi
-  repo="${positional[0]:-}"
+  repo="$(resolve_repo_selector "${positional[0]:-}")"
   work_id="${positional[1]:-}"
   branch="${positional[2]:-}"
   [[ -n "$repo" && -n "$work_id" ]] || die "$usage_create"
@@ -632,7 +647,11 @@ or:  swarm create $repo $work_id task/${work_id} --track $branch"
   validate_work_id "$work_id"
   is_checkout_root "$REPOS_DIR/$repo" || die "registered repo unavailable: $repo"
   require_main_checkout "$REPOS_DIR/$repo"
-  local wt_path="$REPOS_DIR/${repo}__${work_id}"
+  local wt_path
+  wt_path="$(resolve_managed_worktree "$repo" "$work_id" "$REPOS_DIR" "$WORKTREES_DIR")"
+  if [[ ! -d "$wt_path" ]] && git -C "$REPOS_DIR/$repo" worktree list --porcelain | grep -Fxq "worktree $wt_path"; then
+    die "worktree metadata exists but checkout is missing: $wt_path; inspect swarm status"
+  fi
   local plan="create worktree $wt_path on branch $branch"
   if [[ -n "$from_ref" ]]; then
     plan="$plan from $from_ref"
@@ -650,7 +669,7 @@ or:  swarm create $repo $work_id task/${work_id} --track $branch"
   local wp_args=("$repo" "$work_id" "$branch")
   [[ -n "$from_ref" ]] && wp_args+=(--from "$from_ref")
   [[ -n "$track_ref" ]] && wp_args+=(--track "$track_ref")
-  "$WP" create "${wp_args[@]}"
+  WP_TARGET_WORKTREE="$wt_path" "$WP" create "${wp_args[@]}"
 }
 
 cmd_sync() {
@@ -1052,14 +1071,7 @@ ensure_gitignore_swarm_block() {
   # Idempotent managed .gitignore block for worktrees + .swarm runtime state.
   local gi="$SWARM_ROOT/.gitignore"
   local desired
-  desired="$(cat <<'EOF'
-# Parallel agent worktrees: <repos_dir>/<repo>__<work-id>/ (see swarm.json)
-*__*/
-
-# Swarm local runtime state (submission inbox)
-.swarm/
-EOF
-)"
+  desired="$(workspace_ignore_rules)"
 
   inspect_swarm_managed_block "$gi"
   case "$_SWARM_BLOCK_STATE" in
@@ -1120,9 +1132,7 @@ Run \`swarm install\` from a terminal to configure this directory, or create swa
   info "Workspace"
   cat >"$SWARM_CONFIG_PATH" <<'EOF'
 {
-  "version": 1,
-  "repos_dir": ".",
-  "state_dir": ".swarm",
+  "version": 2,
   "repos": []
 }
 EOF
@@ -1509,6 +1519,7 @@ main() {
   esac
 
   case "$cmd" in
+    migrate) cmd_migrate "$@" ;;
     add) cmd_add "$@" ;;
     status) cmd_status "$@" ;;
     config) cmd_config "$@" ;;
@@ -1528,4 +1539,5 @@ main() {
 }
 
 source "$CLI_DIR/lib/workspace.sh"
+source "$CLI_DIR/lib/migrate.sh"
 main "$@"

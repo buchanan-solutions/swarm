@@ -43,6 +43,21 @@ safe_repo_path() {
   validate_repo_name "$1"
   local resolved
   resolved="$(realpath -m "$2/$1")"
-  [[ "$resolved" == "$2/"* ]] || die "repository path escapes repos_dir: $1"
+  [[ "$resolved" == "$2/"* ]] || die "repository path escapes its workspace boundary: $1"
   printf '%s\n' "$resolved"
+}
+
+# Location is independent of logical repo/work identity. Registered legacy
+# siblings are reused; new worktrees use the centralized directory.
+resolve_managed_worktree() {
+  local repo="$1" work="$2" repo_base="$3" tree_base="$4"
+  local canonical="$repo_base/$repo" preferred="$tree_base/${repo}__${work}"
+  local legacy="${canonical}__${work}" path matches=()
+  while IFS= read -r path; do
+    path="${path#worktree }"
+    if [[ "$path" == "$preferred" || "$path" == "$legacy" ]]; then matches+=("$path"); fi
+  done < <(git -C "$canonical" worktree list --porcelain 2>/dev/null | sed -n '/^worktree /p')
+  [[ ${#matches[@]} -le 1 ]] || die "multiple worktrees for $repo/$work; resolve duplicate checkouts first"
+  if [[ ${#matches[@]} -eq 1 ]]; then printf '%s\n' "${matches[0]}"
+  else printf '%s\n' "$preferred"; fi
 }
