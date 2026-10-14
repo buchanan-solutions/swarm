@@ -149,7 +149,8 @@ Do not develop in the canonical checkout when parallel work is expected.
 
 `branch` is the new local branch for the worktree (default `task/<work-id>`).
 `--from` is an optional starting ref (local branch, remote-tracking branch,
-tag, or commit; default canonical trunk). `--track` starts from a remote
+tag, or commit; default the canonical source checkout's current committed `HEAD`,
+not `origin/main` or the calling worktree's branch). Uncommitted edits are not copied. `--track` starts from a remote
 branch and also sets it as the local branch's upstream (`--track` implies
 `--from` when `--from` is omitted). Both apply only when creating the branch;
 once it exists, Swarm tracks the local branch normally and does not manage

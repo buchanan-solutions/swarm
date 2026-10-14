@@ -382,13 +382,12 @@ or:  wp create $repo $work_id task/${work_id} --track $branch"
     die "path exists but is not a registered worktree of $repo: $wt_path"
   fi
 
-  # Resolve default start point (canonical trunk) when --from/--track omitted.
+  # Snapshot the source checkout HEAD before fetch; remote defaults do not select it.
   local start_point
   if [[ -n "$from_ref" ]]; then
     start_point="$from_ref"
   else
-    ensure_base_ref "$repo_path"
-    start_point="$BASE_REF"
+    start_point="$(git -C "$repo_path" rev-parse --verify 'HEAD^{commit}')" || die "source checkout has no committed HEAD; supply --from or commit first"
   fi
 
   local plan created_new=1
@@ -415,13 +414,7 @@ or:  wp create $repo $work_id task/${work_id} --track $branch"
   info "fetching origin in $repo …"
   git -C "$repo_path" fetch origin --prune 2>&1 | tail -n 5 || warn "fetch failed or had warnings"
 
-  # Re-resolve trunk after fetch when using the default start point.
-  if [[ -n "$from_ref" ]]; then
-    start_point="$from_ref"
-  else
-    ensure_base_ref "$repo_path"
-    start_point="$BASE_REF"
-  fi
+  # Explicit refs may have been updated by fetch; the default HEAD snapshot stays fixed.
 
   local occupied
   occupied="$(git -C "$repo_path" worktree list --porcelain | awk -v b="refs/heads/$branch" '

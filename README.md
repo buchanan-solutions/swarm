@@ -189,8 +189,10 @@ swarm integrate ts-mono 1234 -m "1234: integrate feature"
 swarm remove ts-mono 1234 --confirm -d
 ```
 
-The default branch is `task/<work-ID>`; an optional positional branch overrides it.
-`--from` selects a starting ref. `--track` additionally sets the branch upstream.
+New branches start at the canonical source checkout's current committed `HEAD`,
+even when you invoke Swarm from another worktree. Uncommitted edits are not copied.
+The default branch name is `task/<work-ID>`; an optional positional branch overrides it.
+`--from` overrides the starting ref. `--track` additionally sets the branch upstream.
 Repeat creation to reuse an existing worktree for the same repo and work ID.
 Branch names may differ from work IDs; worktree identity never depends on the branch.
 

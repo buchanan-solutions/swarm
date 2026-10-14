@@ -194,7 +194,8 @@ Worktree targets also accept repo-name___work-ID or an absolute managed path.
 Omit the repo name inside its canonical checkout or a managed worktree.
 path <repo-name> selects its canonical checkout; path alone uses the current repo.
 open uses an explicit launcher or default_ide (cursor, claude, codex; initially blank).
-create defaults the branch to task/<work-ID>. Git is the worktree source of truth.
+create defaults to source checkout HEAD and branch task/<work-ID>.
+--from / --track override the starting ref. Git is the worktree source of truth.
 
 Config: nearest ancestor swarm.json; version 2, repos is a name-to-path object.
 Paths: relative to the config, including "." for a workspace-root checkout.
@@ -401,6 +402,10 @@ or:  swarm create $repo $work_id task/${work_id} --track $branch"
     plan="$plan from $from_ref"
   elif [[ -n "$track_ref" ]]; then
     plan="$plan from $track_ref"
+  else
+    local source_head
+    source_head="$(git -C "$(repo_abs "$repo")" rev-parse --verify 'HEAD^{commit}')" || die "source checkout has no committed HEAD; supply --from or commit first"
+    plan="$plan from source checkout HEAD ($source_head)"
   fi
   if [[ -n "$track_ref" ]]; then
     plan="$plan tracking $track_ref"
