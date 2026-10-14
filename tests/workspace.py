@@ -1,4 +1,4 @@
-"""Black-box CLI tests using disposable Git repositories; no network required."""
+"""Offline black-box coverage for Swarm's public CLI and migration."""
 import json
 import os
 import pathlib
@@ -20,105 +20,171 @@ class Workspace(unittest.TestCase):
         self.runcli('init')
     def tearDown(self):
         self.tmp.cleanup()
-    def cmd(self, args, cwd=None, ok=True):
-        result = subprocess.run(args, cwd=cwd or self.root, env=ENV, text=True,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
-        if ok:
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        else:
-            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+    def cmd(self, args, cwd=None, ok=True, env=None):
+        result = subprocess.run(args, cwd=cwd or self.root, env=env or ENV, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25)
+        self.assertEqual(result.returncode == 0, ok, result.stdout + result.stderr)
         return result
-    def runcli(self, *args, cwd=None, ok=True):
-        return self.cmd([CLI, *args], cwd, ok)
+    def runcli(self, *args, cwd=None, ok=True, env=None):
+        return self.cmd([CLI, *args], cwd, ok, env)
+    def interactive(self, args, answers, cwd=None, ok=True):
+        master, slave = pty.openpty()
+        proc = subprocess.Popen([CLI, *args], cwd=cwd or self.root, env=ENV,
+                                stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        os.close(slave)
+        os.write(master, answers)
+        out, err = proc.communicate(timeout=25)
+        os.close(master)
+        self.assertEqual(proc.returncode == 0, ok, out + err)
+        return out.decode(), err.decode()
     def git(self, path, *args):
         return self.cmd(['git', '-C', str(path), *args])
     def repo(self, relative):
         path = self.root / relative
-        path.mkdir(parents=True)
+        path.mkdir(parents=True, exist_ok=True)
         self.git(path, 'init', '-b', 'main')
         (path / 'hello').write_text('hello\n')
         self.git(path, 'add', '.')
         self.git(path, 'commit', '-m', 'initial')
         self.git(path, 'remote', 'add', 'origin', str(path))
         return path
-    def register(self, relative):
+    def register(self, relative, name='api'):
         path = self.repo(relative)
-        self.runcli('add', '.', cwd=path)
+        self.runcli('add', '.', '--name', name, cwd=path)
         return path
     def config(self):
         return json.loads((self.root / 'swarm.json').read_text())
-    def test_registration(self):
-        repo = self.register('a/deep/repo with spaces')
-        before = (self.root / 'swarm.json').read_bytes()
-        self.assertIn('Already registered', self.runcli('add', 'a/deep/../deep/repo with spaces').stdout)
-        self.assertIn('Already initialized', self.runcli('init').stdout)
-        self.assertEqual(before, (self.root / 'swarm.json').read_bytes())
-        self.assertEqual(self.config()['repos'], ['a/deep/repo with spaces'])
-        (repo / 'src').mkdir()
-        self.runcli('add', 'src', cwd=repo, ok=False)
-        outside = pathlib.Path(tempfile.mkdtemp(prefix='swarm-outside-'))
-        try:
-            self.git(outside, 'init')
-            self.runcli('add', str(outside), ok=False)
-        finally:
-            shutil.rmtree(outside)
-    def test_full_lifecycle(self):
-        repo = self.register('a/deep/app')
-        self.register('b/app')
-        self.runcli('create', 'feature', cwd=repo)
-        wt = self.root / '.swarm/worktrees/a/deep/app__feature'
-        self.runcli('create', 'b/app', 'feature')
-        self.assertTrue(wt.is_dir())
-        self.assertIn('a/deep/app', self.runcli('config', cwd=wt).stdout)
-        self.assertNotIn('b/app', self.runcli('list', cwd=wt).stdout)
-        self.assertIn('b/app', self.runcli('list', '--all', cwd=wt).stdout)
-        self.runcli('check', 'a/deep/app__feature')
-        self.runcli('sync', str(wt))
-        (wt / 'feature').write_text('feature\n')
+    def write_config(self, config):
+        (self.root / 'swarm.json').write_text(json.dumps(config))
+    def wt(self, name='api', work='1234'):
+        return self.root / '.swarm/worktrees' / (name + '___' + work)
+    def feature(self, wt):
+        (wt / 'feature').write_text('ready\n')
         self.git(wt, 'add', '.')
         self.git(wt, 'commit', '-m', 'feature')
-        self.runcli('submit', 'a/deep/app__feature')
-        self.assertTrue((self.root / '.swarm/submissions/a/deep/app__feature').is_file())
-        self.runcli('review', 'a/deep/app__feature')
-        self.runcli('integrate', 'a/deep/app__feature', '--dry-run')
-        self.runcli('integrate', 'a/deep/app__feature')
+
+    def test_init_and_registration(self):
+        self.assertEqual(self.config(), {'version': 2, 'default_ide': '', 'repos': {}})
+        self.assertNotIn('*__*/', (self.root / '.gitignore').read_text())
+        repo = self.repo('a/deep/ts-mono')
+        self.runcli('add', str(repo), ok=False)
+        out, err = self.interactive(['add', str(repo)], b'\n')
+        self.assertIn('ts-mono', err)
+        self.assertEqual(self.config()['repos'], {'ts-mono': 'a/deep/ts-mono'})
+        before = (self.root / 'swarm.json').read_bytes()
+        self.runcli('add', '.', cwd=repo)
+        self.runcli('init')
+        self.assertEqual(before, (self.root / 'swarm.json').read_bytes())
+        other = self.repo('b/ts-mono')
+        out, err = self.interactive(['add', str(other)], b'\ninvalid___name\nsecondary\n')
+        self.assertIn('already', err)
+        self.assertEqual(self.config()['repos']['secondary'], 'b/ts-mono')
+        self.runcli('add', '.', '--name', 'another', cwd=repo, ok=False)
+        self.runcli('add', str(other), '--name', 'secondary')
+        repo2 = self.repo('repo__with spaces')
+        self.runcli('add', str(repo2), '--name', 'spaces')
+        self.assertEqual(self.config()['repos']['spaces'], 'repo__with spaces')
+        for index, bad in enumerate(['bad___name', 'trailing_', '../bad', 'has space']):
+            fresh = self.repo('fresh-' + str(index))
+            self.runcli('add', str(fresh), '--name', bad, ok=False)
+
+    def test_registration_cancellation_boundaries_and_concurrency(self):
+        repo = self.repo('one')
+        before = (self.root / 'swarm.json').read_bytes()
+        self.interactive(['add', str(repo)], b'\x04', ok=False)
+        self.assertEqual(before, (self.root / 'swarm.json').read_bytes())
+        other = self.repo('two')
+        jobs = [subprocess.Popen([CLI, 'add', str(path), '--name', path.name], cwd=self.root,
+                                 env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                for path in [repo, other]]
+        for job in jobs:
+            out, err = job.communicate(timeout=25)
+            self.assertEqual(job.returncode, 0, out + err)
+        self.assertEqual(self.config()['repos'], {'one': 'one', 'two': 'two'})
+        self.runcli('add', str(repo / 'hello'), '--name', 'file', ok=False)
+        with tempfile.TemporaryDirectory() as outside:
+            self.git(outside, 'init')
+            self.runcli('add', outside, '--name', 'outside', ok=False)
+        hidden = self.repo('.swarm/hidden')
+        self.runcli('add', str(hidden), '--name', 'hidden', ok=False)
+
+    def test_full_lifecycle_and_target_forms(self):
+        repo = self.register('deep/services/api')
+        self.register('second/api', 'secondary')
+        self.runcli('create', '1234', '--from', 'HEAD', cwd=repo)
+        wt = self.wt()
+        self.assertTrue(wt.is_dir())
+        self.runcli('create', 'api', '1234')
+        self.runcli('check', 'api', '1234')
+        self.runcli('check', 'api___1234')
+        self.runcli('check', str(wt))
+        self.runcli('check', '1234', cwd=wt)
+        self.runcli('check', 'api/1234', ok=False)
+        self.runcli('check', 'api', '1234', 'extra', ok=False)
+        self.runcli('create', 'api', 'bad___id', ok=False)
+        self.runcli('create', 'api', 'future', '--dry-run')
+        self.assertFalse(self.wt('api', 'future').exists())
+        self.runcli('sync', 'api', '1234')
+        self.feature(wt)
+        self.runcli('submit', '1234', cwd=wt)
+        self.assertTrue((self.root / '.swarm/submissions/api___1234').is_file())
+        self.runcli('review', 'api', '1234')
+        self.runcli('integrate', 'api', '1234', '--dry-run')
+        self.runcli('integrate', 'api', '1234', '-m', 'Integrate feature')
         self.assertTrue((repo / 'feature').is_file())
-        # remove deliberately requires a TTY and a separate typed Y confirmation.
-        master, slave = pty.openpty()
-        proc = subprocess.Popen([CLI, 'remove', 'a/deep/app__feature', '--confirm', '-d'],
-                                cwd=self.root, env=ENV, stdin=slave, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE)
-        os.close(slave)
-        os.write(master, b'Y\n')
-        out, err = proc.communicate(timeout=15)
-        os.close(master)
-        self.assertEqual(proc.returncode, 0, out + err)
+        self.runcli('remove', 'api', '1234', ok=False)
+        self.interactive(['remove', 'api', '1234', '--confirm', '-d'], b'Y\n')
         self.assertFalse(wt.exists())
-    def test_worktrees_submodules_and_inference(self):
-        parent = self.register('parent')
-        source = self.repo('source')
-        self.git(parent, '-c', 'protocol.file.allow=always', 'submodule', 'add', str(source), 'nested/sub')
-        self.git(parent, 'commit', '-am', 'submodule')
-        sub = parent / 'nested/sub'
-        self.assertIn('Current repo: none', self.runcli('config', cwd=sub).stdout)
-        self.git(sub, 'remote', 'set-url', 'origin', str(source))
-        self.runcli('add', '.', cwd=sub)
-        self.runcli('create', 'subwork', cwd=sub)
-        wt = self.root / '.swarm/worktrees/parent/nested/sub__subwork'
-        self.runcli('add', '.', cwd=wt, ok=False)
-        err = self.runcli('init', cwd=wt, ok=False).stderr
-        self.assertIn(str(sub), err)
-        self.runcli('check', 'parent/nested/sub__subwork')
-        self.assertIn('CANONICAL', self.runcli('status', 'parent/nested/sub').stdout)
-        self.assertIn('parent/nested/sub__subwork', self.runcli('list', cwd=wt).stdout)
-    def test_stale_health_and_sizes(self):
-        repo = self.register('deep/repo')
-        self.runcli('create', 'deep/repo', 'dead')
-        shutil.rmtree(self.root / '.swarm/worktrees/deep/repo__dead')
-        self.register('healthy')
-        result = self.runcli('status', '--sizes')
-        self.assertIn('MISSING/INVALID', result.stdout)
-        self.assertIn('cached', result.stdout)
+
+    def test_paths_inference_listing_and_external_health(self):
+        repo = self.register('deep folder/api')
+        self.register('other/api', 'secondary')
+        self.runcli('create', 'api', 'one')
+        self.runcli('create', 'secondary', 'two')
+        wt = self.wt('api', 'one')
+        for args, cwd, expected in [(['path', 'api'], self.root, repo),
+                                    (['path'], wt, repo),
+                                    (['path', 'api', 'one'], self.root, wt),
+                                    (['path', 'one'], wt, wt),
+                                    (['path', 'api___one'], self.root, wt),
+                                    (['path', str(wt)], self.root, wt)]:
+            self.assertEqual(self.runcli(*args, cwd=cwd).stdout, str(expected) + '\n')
+        self.runcli('path', ok=False)
+        self.runcli('path', 'api', 'missing', ok=False)
+        self.assertNotIn('secondary', self.runcli('list', cwd=wt).stdout)
+        self.assertIn('secondary', self.runcli('list', '--all', cwd=wt).stdout)
+        self.assertNotIn('secondary', self.runcli('list', 'api').stdout)
+        self.runcli('list', 'api', '--all', ok=False)
+        self.assertIn('Canonical path:', self.runcli('config', cwd=wt).stdout)
+        external = self.root / 'external'
+        self.git(repo, 'worktree', 'add', '-b', 'external', str(external))
+        self.assertIn('EXTERNAL', self.runcli('list', 'api').stdout)
+        self.runcli('check', str(external), ok=False)
+        shutil.rmtree(wt)
+        self.assertIn('MISSING/INVALID', self.runcli('status').stdout)
+        self.runcli('create', 'api', 'one', ok=False)
+        shutil.rmtree(repo)
+        self.assertIn('warning:', self.runcli('path', 'secondary').stderr)
+        self.runcli('create', 'secondary', 'three')
+        self.assertNotIn('error:', self.runcli('sync', 'secondary', 'two').stderr)
+        self.runcli('path', 'api', ok=False)
+
+    def test_schema_validation_and_size_cache(self):
+        repo = self.register('api')
+        cfg = self.config()
+        for bad in [None, False, 7, 'vscode', 'Cursor']:
+            cfg['default_ide'] = bad; self.write_config(cfg)
+            self.runcli('config', ok=False)
+        cfg.pop('default_ide'); self.write_config(cfg)
+        self.runcli('config')
+        for bad in ['../escape', '/absolute', '.swarm/hidden']:
+            cfg['repos'] = {'bad': bad}; self.write_config(cfg)
+            self.runcli('status', ok=False)
+        cfg['repos'] = {'api': 'api', 'duplicate': 'api'}; self.write_config(cfg)
+        self.runcli('status', ok=False)
+        cfg['repos'] = {'api': 'api'}; self.write_config(cfg)
+        self.runcli('create', 'api', 'one')
+        self.assertIn('cached', self.runcli('status', '--sizes').stdout)
         caches = list((self.root / '.swarm/sizes').glob('*.json'))
         before = {p: p.read_bytes() for p in caches}
         self.runcli('status', '--sizes')
@@ -127,246 +193,234 @@ class Workspace(unittest.TestCase):
             data = json.loads(p.read_text()); data['timestamp'] = 1; p.write_text(json.dumps(data))
         self.runcli('status', '--sizes')
         self.assertTrue(all(json.loads(p.read_text())['timestamp'] > 1 for p in caches))
-        self.runcli('status', '--refresh-sizes')
-        for p in caches: p.write_text('broken json')
+        for p in caches: p.write_text('broken')
         self.runcli('status')
-        self.runcli('status', '--sizes')
-        shutil.rmtree(repo)
-        self.assertIn('warning:', self.runcli('list').stderr)
-        self.runcli('create', 'healthy', 'ok')
-        self.runcli('create', 'deep/repo', 'bad', ok=False)
-        (self.root / '.swarm/submissions/healthy__orphan').touch()
+        self.runcli('status', '--refresh-sizes')
+        (self.root / '.swarm/submissions/api___gone').touch()
         self.assertIn('ORPHAN', self.runcli('status').stdout)
-    def test_spaces_external_worktrees_and_atomic_add(self):
-        repo = self.repo('space folder/repo')
-        other = self.repo('second')
-        config = self.config(); config['custom'] = {'keep': True}
-        (self.root / 'swarm.json').write_text(json.dumps(config))
-        jobs = [subprocess.Popen([CLI, 'add', str(path)], cwd=self.root, env=ENV,
-                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                for path in [repo, other]]
-        for job in jobs:
-            out, err = job.communicate(timeout=20)
-            self.assertEqual(job.returncode, 0, out + err)
-        self.assertEqual(set(self.config()['repos']), {'space folder/repo', 'second'})
-        self.assertEqual(self.config()['custom'], {'keep': True})
-        self.runcli('create', 'space folder/repo', 'one')
-        self.runcli('check', 'space folder/repo__one')
-        self.runcli('create', 'one', cwd=repo)  # idempotent reuse
-        external = self.root / 'external'
-        self.git(repo, 'worktree', 'add', '-b', 'external', str(external))
-        self.assertIn('EXTERNAL', self.runcli('status').stdout)
-        self.assertIn(str(repo), self.runcli('add', str(external), ok=False).stderr)
-        # A worktree-shaped independent repo must never be integrated or removed.
-        fake = self.repo('.swarm/worktrees/second__fake')
-        self.runcli('check', 'second__fake', ok=False)
-        self.runcli('remove', 'second__fake', '--confirm', ok=False)
+
+    def test_submodules_and_wrong_ownership(self):
+        parent = self.register('parent', 'parent')
+        source = self.repo('source')
+        self.git(parent, '-c', 'protocol.file.allow=always', 'submodule', 'add', str(source), 'nested/sub')
+        self.git(parent, 'commit', '-am', 'submodule')
+        sub = parent / 'nested/sub'
+        self.assertIn('Current repo: none', self.runcli('config', cwd=sub).stdout)
+        self.git(sub, 'remote', 'set-url', 'origin', str(source))
+        self.runcli('add', '.', '--name', 'sub', cwd=sub)
+        self.runcli('create', 'one', cwd=sub)
+        wt = self.wt('sub', 'one')
+        self.runcli('check', 'sub', 'one')
+        self.assertIn(str(sub), self.runcli('init', cwd=wt, ok=False).stderr)
+        self.runcli('add', str(wt), '--name', 'bad', ok=False)
+        fake = self.repo('.swarm/worktrees/parent___fake')
+        self.runcli('check', 'parent', 'fake', ok=False)
+        self.runcli('remove', 'parent', 'fake', '--confirm', ok=False)
         self.assertTrue(fake.is_dir())
 
-    def legacy_workspace(self, state='.swarm'):
-        config = {'version': 1, 'repos_dir': 'services', 'state_dir': state,
-                  'repos': ['api'], 'custom': {'preserve': True}}
-        repo = self.repo('services/api')
-        (self.root / 'swarm.json').write_text(json.dumps(config))
-        (self.root / 'swarm.md').write_text('Keep these project instructions.\n')
-        (self.root / '.gitignore').write_text('user-rule\n# <-- swarm:start -->\n*__*/\n.swarm/\n# <-- swarm:end -->\nafter-rule\n')
-        self.runcli('create', 'api', 'active')
-        wt = self.root / 'services/api__active'
-        (wt / 'feature').write_text('ready\n')
-        self.git(wt, 'add', '.')
-        self.git(wt, 'commit', '-m', 'feature')
-        self.runcli('submit', 'api__active')
-        return repo, wt, config
+    def test_launcher_selection_and_failures(self):
+        repo = self.register('deep/api')
+        self.runcli('create', 'api', 'one')
+        wt = self.wt('api', 'one')
+        self.assertIn('No default IDE', self.runcli('open', 'api', 'one', ok=False).stderr)
+        initial = self.config(); initial.pop('default_ide'); self.write_config(initial)
+        self.assertIn('No default IDE', self.runcli('open', 'api', 'one', ok=False).stderr)
+        bindir = self.root / 'bin'; bindir.mkdir()
+        log = self.root / 'launch.json'
+        for name in ['cursor', 'claude', 'codex']:
+            exe = bindir / name
+            exe.write_text('#!/usr/bin/env python3\nimport os,sys,json\nopen(os.environ["LAUNCH_LOG"],"w").write(json.dumps({"exe":os.path.basename(sys.argv[0]),"args":sys.argv[1:],"cwd":os.getcwd()}))\nsys.exit(int(os.environ.get("LAUNCH_EXIT","0")))\n')
+            exe.chmod(0o755)
+        env = dict(ENV, PATH=str(bindir) + ':' + ENV['PATH'], LAUNCH_LOG=str(log))
+        cfg = self.config()
+        for name in ['cursor', 'claude', 'codex']:
+            cfg['default_ide'] = name; self.write_config(cfg)
+            self.runcli('open', 'one', cwd=repo, env=env)
+            record = json.loads(log.read_text())
+            self.assertEqual(record['exe'], name)
+            if name == 'cursor': self.assertEqual(record['args'], ['--new-window', str(wt)])
+            if name == 'claude': self.assertEqual(record['cwd'], str(wt))
+            if name == 'codex': self.assertEqual(record['args'], ['--cd', str(wt)])
+        self.runcli('open', 'api', '--cursor', env=env)
+        self.assertEqual(json.loads(log.read_text())['args'], ['--new-window', str(repo)])
+        self.runcli('open', 'api', '--cursor', '--claude', env=env, ok=False)
+        self.runcli('open', 'api', '--vscode', env=env, ok=False)
+        result = subprocess.run([CLI, 'open', 'api', '--cursor'], cwd=self.root,
+                                env=dict(env, LAUNCH_EXIT='17'), capture_output=True)
+        self.assertEqual(result.returncode, 17)
+        (bindir / 'claude').unlink()
+        only_tools = self.root / 'tools-only'; only_tools.mkdir()
+        for tool in ['bash', 'git', 'jq', 'dirname', 'realpath', 'mkdir', 'sed', 'grep']:
+            (only_tools / tool).symlink_to(shutil.which(tool))
+        missing_env = dict(env, PATH=str(only_tools))
+        self.assertIn('not found', self.runcli('open', 'api', '--claude', env=missing_env, ok=False).stderr)
 
-    def test_v1_migration_and_active_lifecycle(self):
-        repo, wt, config = self.legacy_workspace()
+    def test_root_repo(self):
+        self.repo('.')
+        self.runcli('add', '.', '--name', 'root')
+        self.assertEqual(self.config()['repos'], {'root': '.'})
+        self.git(self.root, 'add', 'swarm.json')
+        self.git(self.root, 'commit', '-m', 'register root')
+        self.runcli('create', 'root', 'one')
+        self.assertEqual(self.runcli('path', 'one', cwd=self.wt('root', 'one')).stdout,
+                         str(self.wt('root', 'one')) + '\n')
+
+    def legacy(self, version=1, state='.swarm', paths=None):
+        paths = paths or ['services/api']
+        repos = [self.repo(p) for p in paths]
+        cfg = {'version': version, 'repos': [p.removeprefix('services/') for p in paths] if version == 1 else paths,
+               'custom': {'keep': True}}
+        if version == 1: cfg.update(repos_dir='services', state_dir=state)
+        self.write_config(cfg)
+        (self.root / 'swarm.md').write_text('Keep project instructions.\n')
+        (self.root / '.gitignore').write_text('user-rule\n# <-- swarm:start -->\n*__*/\n.swarm/\n# <-- swarm:end -->\nafter-rule\n')
+        return repos, cfg
+    def old_work(self, repo, version, state='.swarm', work='active', central=False):
+        rel = str(repo.relative_to(self.root))
+        wt = self.root / '.swarm/worktrees' / (rel + '__' + work) if central else pathlib.Path(str(repo) + '__' + work)
+        self.git(repo, 'worktree', 'add', '-b', 'task/' + work, str(wt))
+        self.feature(wt)
+        key = rel.removeprefix('services/') if version == 1 else rel
+        marker = self.root / state / 'submissions' / (key + '__' + work)
+        marker.parent.mkdir(parents=True, exist_ok=True); marker.touch()
+        return wt, marker
+
+    def test_v1_migration_active_lifecycle(self):
+        repos, cfg = self.legacy()
+        wt, marker = self.old_work(repos[0], 1)
+        self.runcli('config', ok=False)
         before = (self.root / 'swarm.json').read_bytes()
-        self.assertIn('"version": 2', self.runcli('migrate', '--dry-run').stdout)
+        self.runcli('migrate', '--dry-run')
         self.assertEqual(before, (self.root / 'swarm.json').read_bytes())
-        self.runcli('migrate')
-        self.assertEqual(self.config(), {'version': 2, 'repos': ['services/api'], 'custom': {'preserve': True}})
-        self.assertEqual((self.root / 'swarm.md').read_text(), 'Keep these project instructions.\n')
+        self.interactive(['migrate'], b'custom-name\n')
+        self.assertEqual(self.config(), {'version': 2, 'default_ide': '', 'repos': {'custom-name': 'services/api'}, 'custom': {'keep': True}})
         self.assertTrue(wt.is_dir())
-        self.assertFalse((self.root / '.swarm/worktrees/services/api__active').exists())
-        self.assertTrue((self.root / '.swarm/submissions/services/api__active').is_file())
-        self.assertFalse((self.root / '.swarm/submissions/api__active').exists())
-        self.assertEqual(json.loads((self.root / '.swarm/migration-v1/config.json').read_text()), config)
-        ignore = (self.root / '.gitignore').read_text()
-        self.assertNotIn('*__*/', ignore)
-        self.assertNotIn('/services/api__active/', ignore)
-        self.assertIn('user-rule', ignore); self.assertIn('after-rule', ignore)
-        self.assertIn('Already version 2', self.runcli('migrate').stdout)
-        self.runcli('check', 'api__active')  # retained legacy selector
-        self.runcli('check', 'api/active')
-        self.assertIn('SUBMITTED', self.runcli('list').stdout)
-        self.runcli('create', 'api', 'active')  # reuses existing sibling
-        self.runcli('create', 'services/api', 'new')
-        self.assertTrue((self.root / '.swarm/worktrees/services/api__new').is_dir())
+        self.assertFalse(marker.exists())
+        self.assertTrue((self.root / '.swarm/submissions/custom-name___active').exists())
+        self.assertEqual(json.loads((self.root / '.swarm/migration/config.json').read_text()), cfg)
+        self.assertEqual((self.root / 'swarm.md').read_text(), 'Keep project instructions.\n')
+        self.assertNotIn('*__*/', (self.root / '.gitignore').read_text())
+        self.assertIn('user-rule', (self.root / '.gitignore').read_text())
+        self.runcli('migrate')
+        self.runcli('check', 'custom-name', 'active')
+        self.runcli('create', 'custom-name', 'active')
+        self.assertFalse(self.wt('custom-name', 'active').exists())
+        self.runcli('create', 'custom-name', 'new')
+        self.assertTrue(self.wt('custom-name', 'new').exists())
         self.runcli('review', str(wt))
-        self.runcli('integrate', 'api__active')
-        self.assertTrue((repo / 'feature').is_file())
-        self.assertFalse((self.root / '.swarm/submissions/services/api__active').exists())
-        self.runcli('sync', str(wt))
-        master, slave = pty.openpty()
-        proc = subprocess.Popen([CLI, 'remove', 'api__active', '--confirm', '-d'],
-                                cwd=self.root, env=ENV, stdin=slave,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        os.close(slave); os.write(master, b'Y\n')
-        out, err = proc.communicate(timeout=15); os.close(master)
-        self.assertEqual(proc.returncode, 0, out + err)
+        self.runcli('integrate', 'custom-name', 'active')
+        self.interactive(['remove', 'custom-name', 'active', '--confirm', '-d'], b'Y\n')
         self.assertFalse(wt.exists())
 
-    def test_custom_state_timestamp_orphans_and_migration_preflight(self):
-        repo, wt, config = self.legacy_workspace('runtime/state')
-        inbox = self.root / 'runtime/state/submissions'
-        (inbox / 'api__active').rename(inbox / '2026-10-14-001__api__active')
-        (inbox / 'gone__orphan').touch()
-        gi = self.root / '.gitignore'
-        valid_ignore = gi.read_text()
-        gi.write_text('user-rule\n# <-- swarm:start -->\n')
-        self.runcli('migrate', ok=False)
-        self.assertEqual(self.config(), config)
-        gi.write_text(valid_ignore)
-        self.runcli('migrate')
-        self.assertTrue((self.root / '.swarm/submissions/services/api__active').is_file())
-        self.assertTrue((self.root / '.swarm/submissions/services/gone__orphan').is_file())
-        self.assertTrue((inbox / '2026-10-14-001__api__active').is_file())
-        self.assertNotIn('/runtime/state/', gi.read_text())
-        self.assertIn('ORPHAN', self.runcli('status').stdout)
+    def test_early_v2_custom_state_and_orphans(self):
+        repos, _ = self.legacy(2)
+        wt, marker = self.old_work(repos[0], 2, central=True)
+        cfg = self.config(); cfg['default_ide'] = 'claude'; self.write_config(cfg)
+        orphan = marker.parent / 'api__gone'; orphan.touch()
+        self.runcli('migrate', '--yes')
+        self.assertEqual(self.config()['default_ide'], 'claude')
+        self.assertTrue((self.root / '.swarm/submissions/api___active').exists())
         self.runcli('check', str(wt))
-        self.runcli('add', '.', cwd=repo)
-        self.assertEqual(self.config()['repos'], ['services/api'])
+        self.assertEqual(self.runcli('path', 'active', cwd=wt).stdout, str(wt) + '\n')
+        self.assertIn('ORPHAN', self.runcli('status').stdout)
 
-    def test_migration_submodule_duplicate_and_missing_worktree_guards(self):
-        repo, wt, _ = self.legacy_workspace()
-        source = self.repo('source')
-        self.git(repo, '-c', 'protocol.file.allow=always', 'submodule', 'add', str(source), 'nested/sub')
-        self.git(repo, 'commit', '-am', 'submodule')
-        sub = repo / 'nested/sub'
-        self.git(sub, 'remote', 'set-url', 'origin', str(source))
-        self.runcli('add', '.', cwd=sub)
-        self.runcli('create', 'subtask', cwd=sub)
-        old_sub_wt = repo / 'nested/sub__subtask'
-        self.runcli('migrate')
-        self.runcli('check', str(old_sub_wt))
-        self.runcli('create', 'newtask', cwd=sub)
-        new_sub_wt = self.root / '.swarm/worktrees/services/api/nested/sub__newtask'
-        self.assertTrue(new_sub_wt.is_dir())
-        self.assertIn('services/api/nested/sub', self.runcli('config', cwd=new_sub_wt).stdout)
-        self.assertIn(str(sub), self.runcli('init', cwd=new_sub_wt, ok=False).stderr)
-        self.runcli('add', str(new_sub_wt), ok=False)
-        duplicate = self.root / '.swarm/worktrees/services/api__active'
-        self.git(repo, 'worktree', 'add', '-b', 'duplicate', str(duplicate))
-        self.runcli('create', 'services/api', 'active', ok=False)
-        self.runcli('check', 'services/api__active', ok=False)
-        self.git(repo, 'worktree', 'remove', str(duplicate))
+    def test_migration_custom_state_timestamp_cancellation_and_preflight(self):
+        repos, cfg = self.legacy(1, 'runtime/state')
+        wt, marker = self.old_work(repos[0], 1, 'runtime/state')
+        timestamp = marker.parent / ('2026-10-14-001__' + marker.name)
+        marker.rename(timestamp)
+        self.runcli('migrate', ok=False)
+        self.interactive(['migrate'], b'\x04', ok=False)
+        self.assertEqual(self.config(), cfg)
+        self.assertTrue(timestamp.exists())
+        gi = self.root / '.gitignore'; original = gi.read_text()
+        gi.write_text('# <-- swarm:start -->\n')
+        self.runcli('migrate', '--yes', ok=False)
+        self.assertEqual(self.config(), cfg)
+        gi.write_text(original)
+        self.runcli('migrate', '--yes')
+        self.assertTrue(timestamp.exists())
+        self.assertTrue((self.root / '.swarm/submissions/api___active').exists())
+        self.runcli('check', str(wt))
+
+    def test_migration_collision_reprompt_and_retry(self):
+        repos, cfg = self.legacy(2, paths=['a/api', 'b/api'])
+        wt, marker = self.old_work(repos[0], 2, central=True)
+        self.runcli('migrate', '--yes', ok=False)
+        self.runcli('migrate', '--dry-run', ok=False)
+        self.assertEqual(self.config(), cfg)
+        self.interactive(['migrate'], b'\n\nsecondary\n')
+        self.assertEqual(self.config()['repos'], {'api': 'a/api', 'secondary': 'b/api'})
+        duplicate = self.wt('api', 'active')
+        self.git(repos[0], 'worktree', 'add', '-b', 'duplicate', str(duplicate))
+        self.runcli('create', 'api', 'active', ok=False)
+        self.runcli('check', 'api', 'active', ok=False)
+        self.git(repos[0], 'worktree', 'remove', str(duplicate))
         shutil.rmtree(wt)
-        self.runcli('create', 'services/api', 'active', ok=False)
-        self.assertIn('MISSING/INVALID', self.runcli('status').stdout)
+        self.runcli('create', 'api', 'active', ok=False)
 
-    def test_interrupted_migration_retry_and_minimal_v2_config(self):
-        self.assertEqual(self.config(), {'version': 2, 'repos': []})
-        self.assertNotIn('*__*/', (self.root / '.gitignore').read_text())
-        repo, wt, config = self.legacy_workspace()
+    def test_migrated_submodule_and_legacy_recognition_scope(self):
+        repos, cfg = self.legacy()
+        parent = repos[0]
+        source = self.repo('source')
+        self.git(parent, '-c', 'protocol.file.allow=always', 'submodule', 'add', str(source), 'nested/sub')
+        self.git(parent, 'commit', '-am', 'submodule')
+        sub = parent / 'nested/sub'
+        self.git(sub, 'remote', 'set-url', 'origin', str(source))
+        cfg['repos'].append('api/nested/sub'); self.write_config(cfg)
+        wt, marker = self.old_work(sub, 1)
+        self.runcli('migrate', '--yes')
+        self.runcli('check', 'sub', 'active')
+        self.runcli('sync', 'active', cwd=wt)
+        self.assertFalse((self.root / '.swarm/submissions/sub___active').exists())
+        self.assertIn('Current repo: sub', self.runcli('config', cwd=wt).stdout)
+        self.runcli('create', 'sub', 'new')
+        self.assertTrue(self.wt('sub', 'new').exists())
+        # A repo added after migration must not inherit old naming rules.
+        fresh = self.register('fresh', 'fresh')
+        manual = pathlib.Path(str(fresh) + '__manual')
+        self.git(fresh, 'worktree', 'add', '-b', 'manual', str(manual))
+        self.assertIn('EXTERNAL', self.runcli('list', 'fresh').stdout)
+        self.runcli('check', str(manual), ok=False)
+
+    def test_migration_interruption_resume(self):
+        repos, cfg = self.legacy()
+        wt, marker = self.old_work(repos[0], 1)
         wrappers = self.root / 'wrappers'; wrappers.mkdir()
         wrapper = wrappers / 'mv'
         wrapper.write_text('#!/bin/bash\nif [[ "${@: -1}" == "' + str(self.root / 'swarm.json') + '" ]]; then exit 42; fi\nexec /usr/bin/mv "$@"\n')
         wrapper.chmod(0o755)
         env = dict(ENV, PATH=str(wrappers) + ':' + ENV['PATH'])
-        result = subprocess.run([CLI, 'migrate'], cwd=self.root, env=env,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(self.config(), config)
-        self.assertTrue((self.root / '.swarm/submissions/api__active').exists())
-        self.assertTrue((self.root / '.swarm/submissions/services/api__active').exists())
-        self.runcli('migrate')
-        self.assertEqual(self.config()['repos'], ['services/api'])
-        self.assertFalse((self.root / '.swarm/submissions/api__active').exists())
-        self.assertFalse((self.root / '.swarm/submissions/services/services/api__active').exists())
+        self.runcli('migrate', '--yes', env=env, ok=False)
+        self.assertEqual(self.config(), cfg)
+        self.assertTrue(marker.exists())
+        self.runcli('migrate', '--yes')
+        self.assertEqual(self.config()['repos'], {'api': 'services/api'})
+        self.assertFalse(marker.exists())
         self.assertIn('SUBMITTED', self.runcli('status').stdout)
         self.runcli('check', str(wt))
 
-    def test_local_skill_installation_paths_and_preservation(self):
-        repo = self.register('services/ts-mono')
+    def test_local_skills_and_parent_confirmation(self):
+        repo = self.register('services/api')
+        self.runcli('install', '--cursor', '--claude', '--codex')
         before = (self.root / 'swarm.json').read_bytes()
-        md = (self.root / 'swarm.md').read_bytes()
-        self.runcli('install', '--cursor', '--claude', '--codex', cwd=repo)
-        for folder in ['.cursor', '.claude', '.agents']:
-            local = repo / folder / 'skills/swarm/SKILL.md'
-            self.assertTrue(local.is_file())
-            self.assertFalse((self.root / folder / 'skills/swarm/SKILL.md').exists())
-        local = repo / '.cursor/skills/swarm/SKILL.md'
-        local.write_text('custom instructions')
-        self.runcli('install', '--cursor', cwd=repo)
-        self.assertEqual(local.read_text(), 'custom instructions')
-        self.assertEqual(before, (self.root / 'swarm.json').read_bytes())
-        self.assertEqual(md, (self.root / 'swarm.md').read_bytes())
-        other = self.repo('deep/other folder')
-        self.runcli('install', '--codex', '../deep/other folder', cwd=repo.parent)
-        self.assertTrue((other / '.agents/skills/swarm/SKILL.md').is_file())
-        self.runcli('install', 'does-not-exist', '--cursor', ok=False)
-        self.assertFalse((self.root / 'does-not-exist').exists())
-        self.runcli('install', '--codex', str(other / 'hello'), ok=False)
-        self.runcli('install', str(other), ok=False)
-        invalid = other / '.cursor/skills/swarm/SKILL.md'
-        invalid.mkdir(parents=True)
-        self.runcli('install', str(other), '--cursor', ok=False)
-
-    def test_parent_skill_confirmation_yes_no_and_noninteractive(self):
-        repo = self.register('services/ts-mono')
-        self.runcli('install', '--cursor')
-        parent_skill = self.root / '.cursor/skills/swarm/SKILL.md'
-        original = parent_skill.read_bytes()
-        failed = self.runcli('install', '--cursor', cwd=repo, ok=False)
-        self.assertIn(str(parent_skill), failed.stderr)
-        self.assertIn('--yes', failed.stderr)
+        self.runcli('install', '--cursor', cwd=repo, ok=False)
+        self.interactive(['install', '--cursor'], b'n\n', cwd=repo)
         local = repo / '.cursor/skills/swarm/SKILL.md'
         self.assertFalse(local.exists())
-        for answer in [b'n\n', b'y\n']:
-            master, slave = pty.openpty()
-            proc = subprocess.Popen([CLI, 'install', '--cursor'], cwd=repo, env=ENV,
-                                    stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            os.close(slave); os.write(master, answer)
-            out, err = proc.communicate(timeout=15); os.close(master)
-            self.assertEqual(proc.returncode, 0, out + err)
-            self.assertEqual(local.exists(), answer == b'y\n')
-        local.unlink()
-        self.runcli('install', 'services/ts-mono', '--cursor', '--yes')
-        self.assertTrue(local.is_file())
-        self.assertEqual(original, parent_skill.read_bytes())
-        self.runcli('install', '--claude', '--codex')
-        self.runcli('install', '.', '--claude', '--codex', '--yes', cwd=repo)
-        self.assertTrue((repo / '.claude/skills/swarm/SKILL.md').exists())
-        self.assertTrue((repo / '.agents/skills/swarm/SKILL.md').exists())
-
-    def test_skills_without_workspace_and_in_generated_worktree(self):
+        self.interactive(['install', '--cursor'], b'y\n', cwd=repo)
+        self.assertTrue(local.exists())
+        local.write_text('custom')
+        self.runcli('install', str(repo), '--cursor', '--claude', '--codex', '--yes')
+        self.assertEqual(local.read_text(), 'custom')
+        self.assertEqual(before, (self.root / 'swarm.json').read_bytes())
+        for folder in ['.claude', '.agents']: self.assertTrue((repo / folder / 'skills/swarm/SKILL.md').exists())
         with tempfile.TemporaryDirectory(prefix='swarm-skills-') as folder:
             self.runcli('install', '--cursor', '--claude', '--codex', cwd=folder)
             self.assertFalse((pathlib.Path(folder) / 'swarm.json').exists())
-            self.assertFalse((pathlib.Path(folder) / 'swarm.md').exists())
-        repo = self.register('services/api')
-        self.runcli('install', '--cursor', '--codex')
-        self.runcli('create', 'feature', cwd=repo)
-        wt = self.root / '.swarm/worktrees/services/api__feature'
-        self.runcli('install', '--cursor', '--codex', '--yes', cwd=wt)
-        self.assertTrue((wt / '.cursor/skills/swarm/SKILL.md').is_file())
-        self.assertTrue((wt / '.agents/skills/swarm/SKILL.md').is_file())
-        self.assertFalse((wt / 'swarm.json').exists())
-
-    def test_config_boundaries_and_legacy(self):
-        self.register('legacy')
-        self.runcli('create', 'legacy', 'one')
-        self.runcli('check', 'legacy/one')
-        self.runcli('create', 'legacy', 'two', '--dry-run')
-        self.assertFalse((self.root / '.swarm/worktrees/legacy__two').exists())
-        config = self.config()
-        for bad in ['../escape', '/absolute', 'a/../legacy', 'bad__name']:
-            config['repos'] = [bad]
-            (self.root / 'swarm.json').write_text(json.dumps(config))
-            self.runcli('status', ok=False)
-        config['repos'] = ['legacy', 'legacy']
-        (self.root / 'swarm.json').write_text(json.dumps(config))
-        self.runcli('status', ok=False)
+        self.runcli('create', 'api', 'one')
+        self.runcli('install', str(self.wt('api', 'one')), '--codex', '--yes')
+        self.assertTrue((self.wt('api', 'one') / '.agents/skills/swarm/SKILL.md').exists())
 
 if __name__ == '__main__':
     unittest.main()

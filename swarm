@@ -3,12 +3,10 @@
 # Config: swarm.json (walk up from $PWD). Skill template: swarm/skills/swarm/SKILL.md
 set -euo pipefail
 
-SWARM_VERSION="0.3.0"
+SWARM_VERSION="0.4.0"
 SWARM_CONFIG_NAME="swarm.json"
-SUPPORTED_CONFIG_VERSION=2
 CONFIG_VERSION=""
 WORKTREES_DIR=""
-LEGACY_REPOS_PREFIX=""
 
 # Set by load_swarm_config (except help/version/install bootstrap)
 SWARM_ROOT=""
@@ -16,7 +14,7 @@ SWARM_CONFIG_PATH=""
 REPOS_DIR=""
 STATE_DIR=""
 SUBMISSIONS_DIR=""
-# Registered relative checkout paths (array preserves spaces).
+# Registered logical repo names.
 REPOS_LIST=()
 CLI_DIR=""
 WP=""
@@ -55,7 +53,7 @@ try_find_swarm_config() {
   local dir
   dir="$(pwd -P)"
   while true; do
-    if [[ -f "$dir/$SWARM_CONFIG_NAME" ]]; then
+    if [[ -f "$dir/$SWARM_CONFIG_NAME" ]] && ! is_copied_root_config "$dir"; then
       SWARM_ROOT="$dir"
       SWARM_CONFIG_PATH="$dir/$SWARM_CONFIG_NAME"
       return 0
@@ -127,82 +125,6 @@ repo_authorized() {
 }
 
 # Validate and load swarm.json already pointed to by SWARM_CONFIG_PATH / SWARM_ROOT.
-load_swarm_config_from_path() {
-  require_jq
-  [[ -n "$SWARM_CONFIG_PATH" && -f "$SWARM_CONFIG_PATH" ]] \
-    || die "invalid $SWARM_CONFIG_NAME: path not set"
-
-  if ! jq -e '.' "$SWARM_CONFIG_PATH" >/dev/null 2>&1; then
-    die "invalid Swarm configuration
-
-Config:
-  $SWARM_CONFIG_PATH
-
-Problem:
-  malformed JSON (jq could not parse the file).
-
-The existing Swarm workspace was not modified.
-Fix swarm.json and rerun."
-  fi
-
-  local repos_dir_rel state_dir_rel
-  CONFIG_VERSION="$(jq -r '.version // empty' "$SWARM_CONFIG_PATH")"
-  case "$CONFIG_VERSION" in
-    1)
-      jq -e '(.repos_dir | type) == "string" and (.state_dir | type) == "string"' "$SWARM_CONFIG_PATH" >/dev/null || die "version 1 requires repos_dir and state_dir strings"
-      repos_dir_rel="$(jq -r '.repos_dir' "$SWARM_CONFIG_PATH")"
-      state_dir_rel="$(jq -r '.state_dir' "$SWARM_CONFIG_PATH")"
-      REPOS_DIR="$(resolve_existing_under_root "$repos_dir_rel" repos_dir)"
-      STATE_DIR="$(resolve_under_root "$state_dir_rel" state_dir)"
-      WORKTREES_DIR="$REPOS_DIR"
-      warn "version 1 workspace; run swarm migrate to adopt version 2"
-      ;;
-    2)
-      jq -e 'has("repos_dir") == false and has("state_dir") == false' "$SWARM_CONFIG_PATH" >/dev/null || die "version 2 has fixed paths; remove repos_dir/state_dir or migrate a version 1 config"
-      REPOS_DIR="$SWARM_ROOT"
-      STATE_DIR="$(resolve_under_root .swarm state)"
-      WORKTREES_DIR="$(resolve_under_root .swarm/worktrees worktrees)"
-      ;;
-    *) die "unsupported config version: $CONFIG_VERSION (supported: 1, 2)" ;;
-  esac
-  SUBMISSIONS_DIR="$STATE_DIR/submissions"
-  mkdir -p "$SUBMISSIONS_DIR"
-  LEGACY_REPOS_PREFIX=""
-  if [[ "$CONFIG_VERSION" == 2 && -f "$STATE_DIR/migration-v1/config.json" ]]; then
-    LEGACY_REPOS_PREFIX="$(realpath -m --relative-to="$SWARM_ROOT" "$SWARM_ROOT/$(jq -r '.repos_dir' "$STATE_DIR/migration-v1/config.json")")"
-    [[ "$LEGACY_REPOS_PREFIX" != . ]] || LEGACY_REPOS_PREFIX=""
-  fi
-
-  REPOS_LIST=()
-  if ! jq -e '.repos | type == "array"' "$SWARM_CONFIG_PATH" >/dev/null 2>&1; then
-    die "invalid Swarm configuration
-
-Config:
-  $SWARM_CONFIG_PATH
-
-Problem:
-  \"repos\" must be an array of repository names.
-
-The existing Swarm workspace was not modified.
-Fix swarm.json and rerun."
-  fi
-
-  local repo path
-  jq -e '.repos | all(.[]; type == "string" and (test("[\\n\\t]") | not))' "$SWARM_CONFIG_PATH" >/dev/null || die "repos must contain strings"
-  while IFS= read -r repo; do
-    [[ "$CONFIG_VERSION" != 2 || "$repo" != .swarm && "$repo" != .swarm/* ]] || die "repo registration points inside Swarm state: $repo"
-    path="$(safe_repo_path "$repo" "$REPOS_DIR")"
-    repo_authorized "$repo" && die "duplicate registered path: $repo"
-    REPOS_LIST+=("$repo")
-    if ! is_checkout_root "$path"; then
-      warn "registered path is missing or not a Git checkout: $repo"
-    elif linked_main_checkout "$path" >/dev/null; then
-      warn "registered path is a linked worktree: $repo"
-    fi
-  done < <(jq -r '.repos[]' "$SWARM_CONFIG_PATH")
-  CURRENT_REPO="$(infer_current_repo)"
-
-}
 
 load_swarm_config() {
   find_swarm_config
@@ -213,6 +135,7 @@ require_wp() {
   [[ -x "$WP" ]] || die "bundled wp missing/not executable: $WP"
   export WP_SERVICES_DIR="$REPOS_DIR"
   export WP_WORKTREES_DIR="$WORKTREES_DIR"
+  export WP_CONFIG_PATH="$SWARM_CONFIG_PATH"
 }
 
 # If DRY_RUN=1, print planned action and return 0 (caller returns). Else return 1.
@@ -238,54 +161,51 @@ consume_dry_run_args() {
 
 usage() {
   cat <<'EOF'
-swarm — parallel worktrees + submission inbox
+swarm — named repos, isolated worktrees, and a human integration inbox
 
-Meta (no workspace required):
-  swarm version
-  swarm help
-
-Most other commands require swarm.json in $PWD or an ancestor (becomes SWARM_ROOT). Needs jq.
-
-Bootstrap:
+Setup:
   swarm init
-  swarm migrate
-  swarm add <path>
+  swarm add <path> [--name <name>]
+  swarm migrate [--dry-run] [--yes]
   swarm install
   swarm install --path
-  swarm install --cursor
-  swarm install --claude
-  swarm install [directory] --cursor --claude --codex [--yes]
-  swarm install --path --cursor --claude
+  swarm install [directory] [--cursor] [--claude] [--codex] [--yes]
 
-Read-only:
+Inspect and navigate:
   swarm config
-  swarm list [--all]
-  swarm status [repo-path] [--sizes | --refresh-sizes]
-  swarm check <repo__work-id>
-  swarm review <repo__work-id>
+  swarm list [repo-name] [--all]
+  swarm status [repo-name] [--sizes | --refresh-sizes]
+  swarm path [repo-name] [work-ID]
+  swarm open [repo-name] [work-ID] [--cursor | --claude | --codex]
+  swarm check [repo-name] <work-ID>
+  swarm review [repo-name] <work-ID>
 
 Agent writes (--dry-run supported):
-  swarm create <repo> <work-id> [branch] [--from <ref>] [--track <remote-branch>] [--dry-run]
-  swarm sync <repo__work-id> [--dry-run]
-  swarm submit <repo__work-id> [--dry-run]
+  swarm create [repo-name] <work-ID> [branch] [--from <ref>] [--track <remote-branch>]
+  swarm sync [repo-name] <work-ID>
+  swarm submit [repo-name] <work-ID>
 
 Human writes:
-  swarm integrate <repo__work-id> [-m "msg"] [--dry-run]
-  swarm remove <repo__work-id> --confirm
-  swarm remove <repo__work-id> --confirm -d
+  swarm integrate [repo-name] <work-ID> [-m "message"] [--dry-run]
+  swarm remove [repo-name] <work-ID> --confirm [-d]
 
-Agents MUST NOT run: integrate, remove
+Agents MUST NOT run integrate or remove.
+Worktree targets also accept repo-name___work-ID or an absolute managed path.
+Omit the repo name inside its canonical checkout or a managed worktree.
+path <repo-name> selects its canonical checkout; path alone uses the current repo.
+open uses an explicit launcher or default_ide (cursor, claude, codex; initially blank).
+create defaults the branch to task/<work-ID>. Git is the worktree source of truth.
 
-install: ensure jq and discover or initialize workspace.
-install [directory] --cursor/--claude/--codex: copy skills locally (default: current directory).
-Existing local skills are preserved; parent duplicates prompt (use --yes for scripts).
-install --path: manage a Swarm-owned PATH block in ~/.bashrc (Bash only).
-swarm config: print resolved root, swarm.json, and swarm.md.
-
-Topology:   <SWARM_ROOT>/swarm.json
-Workspace:  <SWARM_ROOT>/swarm.md (optional agent instructions)
-State:      <SWARM_ROOT>/.swarm/submissions/<repo>__<work-id>
-Worktrees:  <SWARM_ROOT>/.swarm/worktrees/<repo-path>__<work-id>/
+Config: nearest ancestor swarm.json; version 2, repos is a name-to-path object.
+Paths: relative to the config, including "." for a workspace-root checkout.
+Worktrees: .swarm/worktrees/<repo-name>___<work-ID>/
+Submissions: .swarm/submissions/<repo-name>___<work-ID>
+add prompts for a name; scripts must pass --name. No automatic suffixes.
+Old v1 / early-v2 array configs require explicit swarm migrate.
+Skill flags install locally (default: current directory), preserving existing skills.
+Parent skill duplicates prompt; --yes accepts duplication, never overwrites.
+install without skill flags configures a workspace; --path manages Bash PATH.
+Meta (no workspace required): swarm help, swarm version.
 EOF
 }
 
@@ -293,186 +213,6 @@ EOF
 # Identity / submissions
 # ---------------------------------------------------------------------------
 
-normalize_worktree_id() {
-  local arg="${1:-}" repo candidate
-  [[ -n "$arg" ]] || die "worktree id required"
-  arg="${arg%/}"
-  if [[ "$arg" == /* ]]; then
-    arg="$(realpath -m "$arg")"
-    local path_id
-    for repo in "${REPOS_LIST[@]}"; do
-      if path_id="$(managed_id_for_path "$repo" "$arg")"; then printf '%s\n' "$path_id"; return; fi
-    done
-    die "not a managed worktree path: $arg"
-  fi
-  arg="${arg#./}"
-  if [[ "$arg" == .swarm/worktrees/* ]]; then arg="${arg#.swarm/worktrees/}"; fi
-  for repo in "${REPOS_LIST[@]}"; do
-    candidate="${arg%%__*}"
-    if [[ "$candidate" == "$repo" && "$arg" == *'__'* ]]; then
-      validate_work_id "${arg#*__}"
-      printf '%s\n' "$arg"; return
-    fi
-  done
-  # Legacy repo/work-id syntax is considered only after full path IDs.
-  for repo in "${REPOS_LIST[@]}"; do
-    if [[ "$arg" == "$repo/"* ]]; then
-      candidate="${arg#"$repo"/}"
-      if [[ "$candidate" != */* ]]; then
-        validate_work_id "$candidate"
-        printf '%s__%s\n' "$repo" "$candidate"; return
-      fi
-    fi
-  done
-  if [[ "$arg" == "$(basename "$REPOS_DIR")/"* ]]; then
-    normalize_worktree_id "${arg#*/}"; return
-  fi
-  if [[ -n "$LEGACY_REPOS_PREFIX" && "$arg" != "$LEGACY_REPOS_PREFIX/"* ]]; then
-    local legacy_repo="${arg%%__*}"
-    if [[ "$arg" == *'__'* ]] && repo_authorized "$LEGACY_REPOS_PREFIX/$legacy_repo"; then
-      normalize_worktree_id "$LEGACY_REPOS_PREFIX/$arg"; return
-    fi
-    if [[ "$arg" == */* ]] && repo_authorized "$LEGACY_REPOS_PREFIX/${arg%/*}"; then
-      normalize_worktree_id "$LEGACY_REPOS_PREFIX/$arg"; return
-    fi
-  fi
-  # Permit a basename id in the current repo, including nested checkouts.
-  if [[ -n "$CURRENT_REPO" && "$arg" == "$(basename "$CURRENT_REPO")__"* ]]; then
-    validate_work_id "${arg#*__}"
-    printf '%s__%s\n' "$CURRENT_REPO" "${arg#*__}"; return
-  fi
-  die "unknown worktree id: $arg (use its registered relative path)"
-}
-
-validate_work_id() {
-  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid work-id: $1"
-}
-
-managed_id_for_path() {
-  local repo="$1" path="$2" prefix work
-  for prefix in "$WORKTREES_DIR/${repo}__" "$REPOS_DIR/${repo}__"; do
-    if [[ "$path" == "$prefix"* ]]; then
-      work="${path#"$prefix"}"
-      [[ "$work" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 1
-      printf '%s__%s\n' "$repo" "$work"; return
-    fi
-  done
-  return 1
-}
-
-infer_current_repo() {
-  local top repo common candidate
-  top="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
-  top="$(realpath "$top")"
-  common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
-  for repo in "${REPOS_LIST[@]}"; do
-    candidate="$REPOS_DIR/$repo"
-    if [[ "$top" == "$candidate" ]]; then printf '%s' "$repo"; return; fi
-    if managed_id_for_path "$repo" "$top" >/dev/null && is_checkout_root "$candidate" &&
-       [[ "$common" == "$(git -C "$candidate" rev-parse --path-format=absolute --git-common-dir)" ]]; then
-      printf '%s' "$repo"; return
-    fi
-  done
-}
-
-worktree_abs() {
-  local id
-  id="$(normalize_worktree_id "$1")"
-  resolve_managed_worktree "${id%%__*}" "${id#*__}" "$REPOS_DIR" "$WORKTREES_DIR"
-}
-
-canonical_abs() {
-  local id repo
-  id="$(normalize_worktree_id "$1")"
-  repo="${id%%__*}"
-  printf '%s\n' "$REPOS_DIR/$repo"
-}
-
-parse_id() {
-  local id
-  id="$(normalize_worktree_id "$1")"
-  _id="$id"
-  _repo="${id%%__*}"
-  _work="${id#*__}"
-}
-
-marker_path() {
-  local id
-  id="$(normalize_worktree_id "$1")"
-  printf '%s\n' "$SUBMISSIONS_DIR/$id"
-}
-
-has_submission() {
-  local m
-  m="$(marker_path "$1")"
-  [[ -e "$m" ]]
-}
-
-touch_submission() {
-  local m
-  m="$(marker_path "$1")"
-  mkdir -p "$(dirname "$m")"
-  : >"$m"
-  info "submitted: $(basename "$m")"
-}
-
-clear_submission() {
-  local m
-  m="$(marker_path "$1")"
-  if [[ -e "$m" ]]; then
-    rm -f "$m"
-    info "cleared submission marker: $(basename "$m")"
-  fi
-  # Also clear legacy timestamp-prefixed markers for same worktree
-  local id base
-  id="$(normalize_worktree_id "$1")"
-  shopt -s nullglob
-  for base in "$(dirname "$SUBMISSIONS_DIR/$id")/"*"__$(basename "$id")" "$SUBMISSIONS_DIR/"*"${id}"; do
-    [[ -e "$base" ]] || continue
-    [[ "$(basename "$base")" == "$id" ]] && continue
-    # only remove if basename ends with __repo__work or equals patterns like DATE__repo__work
-    if [[ "$(basename "$base")" == *"__$(basename "$id")" ]]; then
-      rm -f "$base"
-      info "cleared legacy marker: $(basename "$base")"
-    fi
-  done
-  shopt -u nullglob
-}
-
-# Legacy: 2026-09-15-0011__ts-mono__2680 → treat as submission for ts-mono__2680
-legacy_submission_for() {
-  local id="$1"
-  local f
-  shopt -s nullglob
-  for f in "$(dirname "$SUBMISSIONS_DIR/$id")/"*"__$(basename "$id")"; do
-    if [[ -e "$f" ]]; then
-      printf '%s\n' "$f"
-      shopt -u nullglob
-      return 0
-    fi
-  done
-  shopt -u nullglob
-  return 1
-}
-
-is_submitted() {
-  has_submission "$1" && return 0
-  legacy_submission_for "$(normalize_worktree_id "$1")" >/dev/null 2>&1
-}
-
-ensure_worktree() {
-  local wt id repo
-  id="$(normalize_worktree_id "$1")"
-  repo="${id%%__*}"
-  repo_authorized "$repo" || die "repository '$repo' is not listed in $SWARM_CONFIG_PATH (repos)"
-  wt="$(worktree_abs "$id")"
-  [[ -d "$wt" ]] || die "worktree not found: $wt"
-  is_checkout_root "$REPOS_DIR/$repo" || die "registered repo unavailable: $repo"
-  require_main_checkout "$REPOS_DIR/$repo"
-  is_checkout_root "$wt" || die "not a git worktree: $wt"
-  [[ "$(git -C "$wt" rev-parse --path-format=absolute --git-common-dir)" == "$(git -C "$REPOS_DIR/$repo" rev-parse --path-format=absolute --git-common-dir)" ]] || die "worktree belongs to another repository: $wt"
-  printf '%s\n' "$wt"
-}
 
 working_tree_state() {
   local dir="$1"
@@ -557,6 +297,8 @@ swarm_state() {
 cmd_config() {
   local md_path="$SWARM_ROOT/swarm.md"
   info "Current repo: ${CURRENT_REPO:-none}"
+  if [[ -n "$CURRENT_REPO" ]]; then info "Canonical path: $(repo_abs "$CURRENT_REPO")"; fi
+  info "Default IDE: ${DEFAULT_IDE:-none}"
   cat <<EOF
 # Swarm Configuration
 
@@ -621,7 +363,7 @@ $usage_create"
     esac
   done
 
-  if [[ -n "$CURRENT_REPO" ]] && ! resolve_repo_selector "${positional[0]:-}" >/dev/null; then
+  if [[ -n "$CURRENT_REPO" ]] && ! repo_authorized "${positional[0]:-}"; then
     positional=("$CURRENT_REPO" "${positional[@]}")
   fi
   repo="$(resolve_repo_selector "${positional[0]:-}")"
@@ -647,11 +389,11 @@ or:  swarm create $repo $work_id task/${work_id} --track $branch"
   esac
 
   validate_work_id "$work_id"
-  is_checkout_root "$REPOS_DIR/$repo" || die "registered repo unavailable: $repo"
-  require_main_checkout "$REPOS_DIR/$repo"
+  is_checkout_root "$(repo_abs "$repo")" || die "registered repo unavailable: $repo"
+  require_main_checkout "$(repo_abs "$repo")"
   local wt_path
-  wt_path="$(resolve_managed_worktree "$repo" "$work_id" "$REPOS_DIR" "$WORKTREES_DIR")"
-  if [[ ! -d "$wt_path" ]] && git -C "$REPOS_DIR/$repo" worktree list --porcelain | grep -Fxq "worktree $wt_path"; then
+  wt_path="$(worktree_abs "${repo}___${work_id}")"
+  if [[ ! -d "$wt_path" ]] && git -C "$(repo_abs "$repo")" worktree list --porcelain | grep -Fx "worktree $wt_path" >/dev/null; then
     die "worktree metadata exists but checkout is missing: $wt_path; inspect swarm status"
   fi
   local plan="create worktree $wt_path on branch $branch"
@@ -677,7 +419,7 @@ or:  swarm create $repo $work_id task/${work_id} --track $branch"
 cmd_sync() {
   require_wp
   local id
-  id="$(normalize_worktree_id "${1:-}")"
+  id="$(resolve_work_target "$@")"
   local wt
   wt="$(ensure_worktree "$id")"
   local plan="merge integration base into $(branch_of "$wt") in $wt"
@@ -696,7 +438,7 @@ cmd_sync() {
 
 cmd_check() {
   local id wt canon branch dirty merge ahead behind
-  id="$(normalize_worktree_id "${1:-}")"
+  id="$(resolve_work_target "$@")"
   wt="$(ensure_worktree "$id")"
   canon="$(canonical_abs "$id")"
   branch="$(branch_of "$wt")"
@@ -724,27 +466,27 @@ EOF
     return 1
   fi
   if [[ "$merge" == "CONFLICT" ]]; then
-    info "Action: SYNC REQUIRED — ./swarm/swarm sync $id"
+    info "Action: SYNC REQUIRED — swarm sync $id"
     return 1
   fi
   if is_submitted "$id"; then
     info "Action: NONE — already SUBMITTED (awaiting human review)."
     return 0
   fi
-  info "Action: READY TO SUBMIT — ./swarm/swarm submit $id"
+  info "Action: READY TO SUBMIT — swarm submit $id"
   return 0
 }
 
 cmd_submit() {
   local id wt canon dirty merge
-  id="$(normalize_worktree_id "${1:-}")"
+  id="$(resolve_work_target "$@")"
   wt="$(ensure_worktree "$id")"
   canon="$(canonical_abs "$id")"
   dirty="$(working_tree_state "$wt")"
   [[ "$dirty" == "clean" ]] || die "worktree is dirty; commit before submit"
   merge="$(mergeability_vs_trunk "$wt" "$canon")"
   if [[ "$merge" == "CONFLICT" ]]; then
-    die "conflicts vs current trunk — run: ./swarm/swarm sync $id"
+    die "conflicts vs current trunk — run: swarm sync $id"
   fi
   if [[ "$merge" == "UNKNOWN" ]]; then
     die "could not determine mergeability vs trunk"
@@ -759,19 +501,25 @@ cmd_submit() {
 
   touch_submission "$id"
   info ""
-  info "Inbox marker written. Human: ./swarm/swarm review $id"
+  info "Inbox marker written. Human: swarm review $id"
 }
 
 cmd_list() {
-  local selected="$CURRENT_REPO"
-  if [[ "${1:-}" == --all ]]; then selected=""; shift; fi
-  [[ $# -eq 0 ]] || die "usage: swarm list [--all]"
+  local selected="$CURRENT_REPO" all=0 explicit=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in --all) all=1 ;; -*) die "unknown list flag: $1" ;;
+      *) [[ -z "$explicit" ]] || die "usage: swarm list [repo-name] [--all]"; explicit="$1" ;; esac
+    shift
+  done
+  [[ "$all" == 0 || -z "$explicit" ]] || die "use a repo name or --all, not both"
+  if [[ -n "$explicit" ]]; then selected="$(resolve_repo_selector "$explicit")"; fi
+  [[ "$all" == 0 ]] || selected=""
   status_tables "$selected" 0 0 1
 }
 
 cmd_review() {
   local id wt canon branch dirty merge ahead
-  id="$(normalize_worktree_id "${1:-}")"
+  id="$(resolve_work_target "$@")"
   wt="$(ensure_worktree "$id")"
   canon="$(canonical_abs "$id")"
   branch="$(branch_of "$wt")"
@@ -854,17 +602,18 @@ EOF
 
 cmd_integrate() {
   local msg="" id=""
+  local targets=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      -m|--message) msg="${2:-}"; shift 2 ;;
+      -m|--message) [[ $# -ge 2 ]] || die "--message requires text"; msg="$2"; shift 2 ;;
       --dry-run) DRY_RUN=1; shift ;;
       -*) die "unknown flag: $1" ;;
-      *) id="$1"; shift ;;
+      *) targets+=("$1"); shift ;;
     esac
   done
-  [[ -n "$id" ]] || die "usage: swarm integrate <repo__work-id> [-m \"msg\"] [--dry-run]"
+  [[ ${#targets[@]} -gt 0 ]] || die "usage: swarm integrate [repo-name] <work-id> [-m message]"
 
-  id="$(normalize_worktree_id "$id")"
+  id="$(resolve_work_target "${targets[@]}")"
   parse_id "$id"
   local wt canon branch dirty merge
   wt="$(ensure_worktree "$id")"
@@ -909,7 +658,7 @@ cmd_integrate() {
 is_protected_branch() {
   local repo="$1" branch="$2"
   local canon trunk_branch
-  canon="$REPOS_DIR/$repo"
+  canon="$(repo_abs "$repo")"
   case "$branch" in
     main|master|HEAD|"") return 0 ;;
   esac
@@ -923,7 +672,8 @@ is_protected_branch() {
 }
 
 cmd_remove() {
-  local delete_branch=0 confirm=0 arg=""
+  local delete_branch=0 confirm=0
+  local targets=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --confirm) confirm=1; shift ;;
@@ -935,15 +685,15 @@ cmd_remove() {
         die "remove does not support --dry-run; use: swarm remove <id> --confirm [-d]"
         ;;
       -*) die "unknown flag: $1" ;;
-      *) arg="$1"; shift ;;
+      *) targets+=("$1"); shift ;;
     esac
   done
-  [[ -n "$arg" ]] || die "usage: swarm remove <repo__work-id> --confirm [-d]"
+  [[ ${#targets[@]} -gt 0 ]] || die "usage: swarm remove [repo-name] <work-id> --confirm [-d]"
   [[ "$confirm" -eq 1 ]] || die "refusing remove without --confirm
-  usage: swarm remove <repo__work-id> --confirm [-d]"
+  usage: swarm remove [repo-name] <work-ID> --confirm [-d]"
 
   local id wt canon repo_path branch
-  id="$(normalize_worktree_id "$arg")"
+  id="$(resolve_work_target "${targets[@]}")"
   parse_id "$id"
   repo_path="$(canonical_abs "$id")"
   wt="$(ensure_worktree "$id")"
@@ -1135,7 +885,8 @@ Run \`swarm install\` from a terminal to configure this directory, or create swa
   cat >"$SWARM_CONFIG_PATH" <<'EOF'
 {
   "version": 2,
-  "repos": []
+  "default_ide": "",
+  "repos": {}
 }
 EOF
   info "  ✓ created swarm.json"
@@ -1544,6 +1295,7 @@ main() {
       ;;
   esac
 
+  if [[ "$cmd" == migrate ]]; then find_swarm_config; cmd_migrate "$@"; return; fi
   load_swarm_config
 
   # Global --dry-run anywhere in argv for write commands (not remove)
@@ -1555,7 +1307,8 @@ main() {
   esac
 
   case "$cmd" in
-    migrate) cmd_migrate "$@" ;;
+    path) cmd_path "$@" ;;
+    open) cmd_open "$@" ;;
     add) cmd_add "$@" ;;
     status) cmd_status "$@" ;;
     config) cmd_config "$@" ;;
@@ -1574,6 +1327,8 @@ main() {
   esac
 }
 
+source "$CLI_DIR/lib/config.sh"
+source "$CLI_DIR/lib/identity.sh"
 source "$CLI_DIR/lib/workspace.sh"
 source "$CLI_DIR/lib/migrate.sh"
 main "$@"

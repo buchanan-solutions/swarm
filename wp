@@ -3,7 +3,7 @@
 # Prefer ./swarm/swarm for agent/human workflows. Not a public CLI.
 set -euo pipefail
 
-WP_VERSION="0.3.0"
+WP_VERSION="0.4.0"
 
 # ---------------------------------------------------------------------------
 # Paths / config
@@ -51,32 +51,7 @@ dry_run_exit() {
   return 1
 }
 
-usage() {
-  cat <<'EOF'
-WPCLI — parallel worktrees for Deploy component repos
-
-Usage:
-  ./wp create <repo> <work-id> [branch] [--from <ref>] [--track <remote-branch>]
-  ./wp list
-  ./wp status [repo__work-id | path]
-  ./wp sync <repo__work-id | path>
-  ./wp remove <repo__work-id | path> [--force]
-  ./wp gc [--apply]
-  ./wp help
-
-Convention:
-  Worktree path:  services/<repo>__<work-id>
-  Preferred id:   ticket number (2680) or short slug (billing-cleanup)
-  New branch:     task/<work-id> unless [branch] is given
-  Start point:    WP_BASE_REF (default origin/main) unless --from / --track
-  --track:        start from that remote branch and set it as upstream
-                  (--track implies --from when --from is omitted)
-
-Environment:
-  WP_SERVICES_DIR   Override services/ location (default: <deploy>/services)
-  WP_BASE_REF       Integration ref for status/sync (default: origin/main)
-EOF
-}
+usage() { info "wp is Swarm's internal create/sync helper. Use swarm --help."; }
 
 # ---------------------------------------------------------------------------
 # Repo / worktree identity
@@ -92,65 +67,33 @@ validate_work_id() {
 
 source "$DEPLOY_ROOT/lib/repos.sh"
 
+helper_repo_relative() {
+  [[ -n "${WP_CONFIG_PATH:-}" ]] || die "wp is internal; run swarm instead"
+  jq -er --arg repo "$1" '.repos[$repo] // empty' "$WP_CONFIG_PATH" || die "unknown repo: $1"
+}
 canonical_repo_path() {
-  local repo="$1"
-  validate_repo_name "$repo"
+  validate_repo_name "$1"
   local path
-  path="$(safe_repo_path "$repo" "$SERVICES_DIR")"
+  path="$(safe_repo_path "$(helper_repo_relative "$1")" "$SERVICES_DIR")"
   is_checkout_root "$path" || die "not a Git checkout: $path"
   require_main_checkout "$path"
-  [[ -d "$path" ]] || die "repo not found: $path"
-  [[ -e "$path/.git" || -d "$path/.git" ]] || die "not a git repository: $path"
-  printf '%s\n' "$path"
+  printf '%s' "$path"
 }
-
 worktree_path_for() {
-  local repo="$1" work_id="$2"
-  resolve_managed_worktree "$repo" "$work_id" "$SERVICES_DIR" "$WORKTREES_DIR"
+  resolve_managed_worktree "$1" "$2" "$(canonical_repo_path "$1")" "$WORKTREES_DIR" "$(helper_repo_relative "$1")" "$(legacy_mode "$1" "$(helper_repo_relative "$1")" "$SERVICES_DIR")"
 }
-
-# Parse user arg into absolute worktree path.
-# Accepts: ts-mono__2680 | services/ts-mono__2680 | /abs/path | ts-mono/2680
 resolve_worktree_arg() {
-  local arg="${1:-}"
-  [[ -n "$arg" ]] || die "worktree argument required"
-
-  local path=""
-  if [[ "$arg" == /* ]]; then
-    path="$arg"
-  elif [[ "$arg" == *"__"* ]]; then
-    # Strip optional services/ prefix
-    local base="${arg#services/}"
-    base="${base%/}"
-    validate_repo_name "${base%%__*}"
-    path="$SERVICES_DIR/$base"
-  elif [[ "$arg" == */* ]]; then
-    # repo/work-id
-    local repo="${arg%%/*}"
-    local rest="${arg#*/}"
-    [[ "$rest" != *"/"* ]] || die "use repo/work-id or repo__work-id: $arg"
-    path="$(worktree_path_for "$repo" "$rest")"
-  else
-    die "expected repo__work-id (or repo/work-id): $arg"
-  fi
-
-  # Normalize
-  if [[ -d "$path" ]]; then
-    path="$(cd "$path" && pwd)"
-  fi
-  printf '%s\n' "$path"
+  [[ "${1:-}" == /* ]] || die "internal wp requires an absolute worktree path"
+  realpath -m "$1"
 }
-
 parse_repo_work_from_path() {
-  # Sets: _repo _work_id from .../repo__work-id
-  local path="$1"
-  local base
-  if [[ "$path" == "$WORKTREES_DIR/"* ]]; then base="${path#"$WORKTREES_DIR"/}"
-  else base="${path#"$SERVICES_DIR"/}"; fi
-  [[ "$base" == *"__"* ]] || die "path is not a WP worktree (expected <repo>__<work-id>): $path"
-  _repo="${base%%__*}"
-  _work_id="${base#*__}"
-  [[ -n "$_repo" && -n "$_work_id" ]] || die "cannot parse repo/work-id from: $base"
+  local path="$1" name work
+  while IFS= read -r name; do
+    if work="$(managed_work_id "$name" "$path" "$(safe_repo_path "$(helper_repo_relative "$name")" "$SERVICES_DIR")" "$WORKTREES_DIR" "$(helper_repo_relative "$name")" "$(legacy_mode "$name" "$(helper_repo_relative "$name")" "$SERVICES_DIR")")"; then
+      _repo="$name"; _work_id="$work"; return
+    fi
+  done < <(jq -r '.repos | keys_unsorted[]' "$WP_CONFIG_PATH")
+  die "not a managed worktree: $path"
 }
 
 is_registered_worktree() {
@@ -537,102 +480,9 @@ Pass a local branch, remote-tracking branch, tag, or commit via --from / --track
   fi
 }
 
-cmd_list() {
-  printf '%-12s %-10s %-36s %-10s %s\n' "REPO" "WORK" "BRANCH" "STATUS" "PATH"
-  local repo_dir repo wt_line wt_path branch status rel
-  shopt -s nullglob
-  for repo_dir in "$SERVICES_DIR"/*/; do
-    repo="$(basename "${repo_dir%/}")"
-    # Skip worktree dirs themselves
-    [[ "$repo" != *"__"* ]] || continue
-    [[ -e "$repo_dir/.git" || -d "$repo_dir/.git" ]] || continue
-
-    # Porcelain worktree list
-    local current_wt="" current_branch=""
-    while IFS= read -r wt_line || [[ -n "$wt_line" ]]; do
-      if [[ "$wt_line" == worktree\ * ]]; then
-        current_wt="${wt_line#worktree }"
-        current_branch=""
-      elif [[ "$wt_line" == branch\ * ]]; then
-        current_branch="${wt_line#branch refs/heads/}"
-      elif [[ -z "$wt_line" && -n "$current_wt" ]]; then
-        # end of record
-        if [[ "$(basename "$current_wt")" == *"__"* ]]; then
-          parse_repo_work_from_path "$current_wt" || true
-          if [[ "${_repo:-}" == "$repo" ]]; then
-            status="$(status_token "$current_wt" 2>/dev/null || echo "?")"
-            rel="${current_wt#"$SERVICES_DIR"/}"
-            printf '%-12s %-10s %-36s %-10s %s\n' \
-              "$repo" "${_work_id:-?}" "${current_branch:-DETACHED}" "$status" "$rel"
-          fi
-        fi
-        current_wt=""
-        current_branch=""
-      fi
-    done < <(git -C "$repo_dir" worktree list --porcelain; printf '\n')
-  done
-  shopt -u nullglob
-}
-
-cmd_status() {
-  local arg="${1:-}"
-  if [[ -z "$arg" ]]; then
-    cmd_list
-    return 0
-  fi
-
-  local wt repo_path
-  wt="$(resolve_worktree_arg "$arg")"
-  [[ -d "$wt" ]] || die "worktree not found: $wt"
-  parse_repo_work_from_path "$wt"
-  repo_path="$(canonical_repo_path "$_repo")"
-  is_registered_worktree "$repo_path" "$wt" || die "not a registered git worktree of $_repo: $wt"
-
-  git -C "$wt" fetch origin --prune >/dev/null 2>&1 || warn "fetch failed"
-
-  ensure_base_ref "$wt"
-  local branch dirty merge remote action
-  branch="$(branch_of_worktree "$wt")"
-  dirty="$(working_tree_state "$wt")"
-  ahead_behind "$wt"
-  remote="$(remote_push_state "$wt")"
-  merge="$(mergeability_vs_base "$wt")"
-
-  cat <<EOF
-Repository:   $_repo
-Work:         $_work_id
-Worktree:     ${wt#"$DEPLOY_ROOT"/}
-Branch:       $branch
-Base:         $BASE_REF
-
-Working tree: $dirty
-Ahead:        ${_ahead} commits
-Behind:       ${_behind} commits
-Remote:       $remote
-
-Mergeability:
-  $BASE_REF → branch: $merge
-EOF
-
-  printf '\nAction:\n'
-  if [[ "$dirty" == "dirty" ]]; then
-    info "  COMMIT — working tree has local changes."
-  elif [[ "$merge" == "CONFLICT" ]]; then
-    info "  SYNC REQUIRED before integration."
-    info "  Run: ./wp sync ${_repo}__${_work_id}"
-  elif [[ "$remote" == "unpushed" || "$remote" == "no-upstream" ]]; then
-    info "  PUSH — local commits are not fully on the remote."
-  elif is_merged_into_base "$wt"; then
-    info "  REMOVE CANDIDATE — branch tip is already in $BASE_REF."
-    info "  Run: ./wp remove ${_repo}__${_work_id}"
-  else
-    info "  NONE — continue working; do not sync merely because branch is behind."
-  fi
-}
-
 cmd_sync() {
   local arg="${1:-}"
-  [[ -n "$arg" ]] || die "usage: wp sync <repo__work-id> [--dry-run]"
+  [[ -n "$arg" ]] || die "usage: wp sync <absolute-worktree-path> [--dry-run]"
   local wt repo_path
   wt="$(resolve_worktree_arg "$arg")"
   [[ -d "$wt" ]] || die "worktree not found: $wt"
@@ -679,249 +529,14 @@ cmd_sync() {
   return 1
 }
 
-cmd_remove() {
-  local arg="" force=0
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --force|-f) force=1; shift ;;
-      --dry-run) DRY_RUN=1; shift ;;
-      -*) die "unknown flag: $1" ;;
-      *) arg="$1"; shift ;;
-    esac
-  done
-  [[ -n "$arg" ]] || die "usage: wp remove <repo__work-id> [--force] [--dry-run]"
-
-  local wt repo_path
-  wt="$(resolve_worktree_arg "$arg")"
-  [[ -d "$wt" ]] || die "worktree not found: $wt"
-  parse_repo_work_from_path "$wt"
-  repo_path="$(canonical_repo_path "$_repo")"
-  is_registered_worktree "$repo_path" "$wt" || die "not a registered worktree: $wt"
-
-  local branch dirty remote
-  branch="$(branch_of_worktree "$wt")"
-  dirty="$(working_tree_state "$wt")"
-  remote="$(remote_push_state "$wt")"
-
-  local reasons=()
-  if [[ "$dirty" == "dirty" ]]; then
-    reasons+=("uncommitted changes")
-  fi
-  if [[ "$remote" == "unpushed" || "$remote" == "no-upstream" ]]; then
-    reasons+=("unpushed commits or no upstream ($remote)")
-  fi
-  if [[ "$DRY_RUN" -eq 0 ]]; then
-    git -C "$wt" fetch origin --prune >/dev/null 2>&1 || true
-  fi
-  ensure_base_ref "$wt"
-  if ! is_merged_into_base "$wt"; then
-    reasons+=("branch tip not integrated into $BASE_REF")
-  fi
-
-  if [[ ${#reasons[@]} -gt 0 && $force -eq 0 ]]; then
-    info "refusing to remove ${_repo}__${_work_id}:"
-    local r
-    for r in "${reasons[@]}"; do
-      info "  - $r"
-    done
-    info ""
-    info "After PR merge (and push), re-run remove — or pass --force if you intend to discard."
-    return 1
-  fi
-
-  local force_note=""
-  if [[ $force -eq 1 && ${#reasons[@]} -gt 0 ]]; then
-    force_note=" (forced despite: ${reasons[*]})"
-  fi
-
-  if dry_run_exit "remove worktree $wt; delete local branch $branch if unused; worktree prune$force_note"; then
-    return 0
-  fi
-
-  if [[ $force -eq 1 && ${#reasons[@]} -gt 0 ]]; then
-    warn "forcing removal despite: ${reasons[*]}"
-  fi
-
-  info "removing worktree $wt"
-  git -C "$repo_path" worktree remove --force "$wt" 2>/dev/null \
-    || git -C "$repo_path" worktree remove "$wt"
-
-  if git -C "$repo_path" show-ref --verify --quiet "refs/heads/$branch"; then
-    if ! git -C "$repo_path" worktree list --porcelain | grep -q "branch refs/heads/$branch"; then
-      info "deleting local branch $branch"
-      git -C "$repo_path" branch -D "$branch" 2>/dev/null \
-        || git -C "$repo_path" branch -d "$branch" || warn "could not delete branch $branch"
-    fi
-  fi
-
-  git -C "$repo_path" worktree prune
-  info "done (remote branch left for GitHub auto-delete after PR merge)"
-}
-
-cmd_gc() {
-  local apply=0
-  if [[ "${1:-}" == "--apply" ]]; then
-    apply=1
-  elif [[ -n "${1:-}" ]]; then
-    die "usage: wp gc [--apply]"
-  fi
-
-  local merged=() orphaned=() active=()
-  local repo_dir repo
-
-  # ORPHANED: directories matching *__* under services not registered
-  shopt -s nullglob
-  local dir base
-  for dir in "$SERVICES_DIR"/*__*/; do
-    [[ -d "$dir" ]] || continue
-    base="$(basename "${dir%/}")"
-    parse_repo_work_from_path "$dir" || continue
-    local rp="$SERVICES_DIR/$_repo"
-    if [[ ! -e "$rp/.git" && ! -d "$rp/.git" ]]; then
-      orphaned+=("$base (no canonical repo $_repo)")
-      continue
-    fi
-    if ! is_registered_worktree "$rp" "$dir"; then
-      orphaned+=("$base")
-    fi
-  done
-
-  printf 'MERGED — SAFE TO REMOVE\n\n'
-  local any_merged=0
-  for repo_dir in "$SERVICES_DIR"/*/; do
-    repo="$(basename "${repo_dir%/}")"
-    [[ "$repo" != *"__"* ]] || continue
-    [[ -e "$repo_dir/.git" || -d "$repo_dir/.git" ]] || continue
-    git -C "$repo_dir" fetch origin --prune >/dev/null 2>&1 || true
-    ensure_base_ref "$repo_dir" 2>/dev/null || continue
-
-    local current_wt="" current_branch=""
-    while IFS= read -r wt_line || [[ -n "$wt_line" ]]; do
-      if [[ "$wt_line" == worktree\ * ]]; then
-        current_wt="${wt_line#worktree }"
-        current_branch=""
-      elif [[ "$wt_line" == branch\ * ]]; then
-        current_branch="${wt_line#branch refs/heads/}"
-      elif [[ -z "$wt_line" && -n "$current_wt" ]]; then
-        if [[ "$(basename "$current_wt")" == *"__"* ]]; then
-          parse_repo_work_from_path "$current_wt" || true
-          if [[ "${_repo:-}" == "$repo" ]]; then
-            if [[ "$(working_tree_state "$current_wt")" == "clean" ]] \
-              && is_merged_into_base "$current_wt"; then
-              any_merged=1
-              local rel="${current_wt#"$SERVICES_DIR"/}"
-              info "$rel"
-              info "  branch ${current_branch:-?}"
-              info "  merged into $BASE_REF"
-              info ""
-              merged+=("$rel")
-            else
-              active+=("${current_wt#"$SERVICES_DIR"/}")
-            fi
-          fi
-        fi
-        current_wt=""
-        current_branch=""
-      fi
-    done < <(git -C "$repo_dir" worktree list --porcelain; printf '\n')
-  done
-  if [[ $any_merged -eq 0 ]]; then
-    info "(none)"
-    info ""
-  fi
-
-  printf 'ORPHANED\n\n'
-  if [[ ${#orphaned[@]} -eq 0 ]]; then
-    info "(none)"
-  else
-    local o
-    for o in "${orphaned[@]}"; do
-      info "$o"
-      info "  directory exists"
-      info "  not registered as worktree"
-      info ""
-    done
-  fi
-  info ""
-
-  printf 'PRUNABLE GIT METADATA\n\n'
-  local any_prune=0
-  for repo_dir in "$SERVICES_DIR"/*/; do
-    repo="$(basename "${repo_dir%/}")"
-    [[ "$repo" != *"__"* ]] || continue
-    [[ -e "$repo_dir/.git" || -d "$repo_dir/.git" ]] || continue
-    # dry-run prune
-    local prune_out
-    prune_out="$(git -C "$repo_dir" worktree prune --verbose --dry-run 2>&1 || true)"
-    if [[ -n "$prune_out" ]]; then
-      any_prune=1
-      info "$repo:"
-      printf '%s\n' "$prune_out" | sed 's/^/  /'
-      info ""
-    fi
-  done
-  if [[ $any_prune -eq 0 ]]; then
-    info "(none)"
-    info ""
-  fi
-
-  printf 'ACTIVE\n\n'
-  if [[ ${#active[@]} -eq 0 ]]; then
-    info "(none)"
-  else
-    local a
-    for a in "${active[@]}"; do
-      info "$a"
-    done
-  fi
-
-  if [[ $apply -eq 1 ]]; then
-    info ""
-    info "Applying safe removals…"
-    local m
-    local self="$DEPLOY_ROOT/wp"
-    for m in "${merged[@]:-}"; do
-      [[ -n "$m" ]] || continue
-      if "$self" remove "$m"; then
-        info "removed $m"
-      else
-        warn "skipped $m (safety checks)"
-      fi
-    done
-    for repo_dir in "$SERVICES_DIR"/*/; do
-      repo="$(basename "${repo_dir%/}")"
-      [[ "$repo" != *"__"* ]] || continue
-      [[ -e "$repo_dir/.git" || -d "$repo_dir/.git" ]] || continue
-      git -C "$repo_dir" worktree prune
-    done
-    info "Note: orphaned directories are not auto-deleted (inspect manually)."
-  else
-    info ""
-    info "Report only. Re-run with: ./wp gc --apply"
-  fi
-}
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 main() {
-  local cmd="${1:-help}"
-  shift || true
+  local cmd="${1:-help}"; shift || true
   case "$cmd" in
     create) cmd_create "$@" ;;
-    list|ls) cmd_list "$@" ;;
-    status|st) cmd_status "$@" ;;
     sync) cmd_sync "$@" ;;
-    remove|rm) cmd_remove "$@" ;;
-    gc) cmd_gc "$@" ;;
-    help|-h|--help) usage ;;
     version|--version) info "wp $WP_VERSION" ;;
-    *)
-      usage >&2
-      die "unknown command: $cmd"
-      ;;
+    help|-h|--help) info "wp is Swarm's internal create/sync helper. Use swarm --help." ;;
+    *) die "wp is internal; use swarm $cmd instead" ;;
   esac
 }
-
 main "$@"

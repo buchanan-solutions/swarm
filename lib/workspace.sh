@@ -17,32 +17,58 @@ cmd_init() {
 }
 
 cmd_add() {
-  [[ $# -eq 1 ]] || die "usage: swarm add <path>"
-  local path repo tmp
-  path="$(realpath -e -- "$1")" || die "path does not exist: $1"
+  local input="" name="" explicit=0 path relative existing tmp
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name) [[ $# -ge 2 && -n "$2" && "$explicit" == 0 ]] || die "--name requires one name"; name="$2"; explicit=1; shift 2 ;;
+      --name=*) [[ "$explicit" == 0 ]] || die "duplicate --name"; name="${1#*=}"; explicit=1; shift ;;
+      -*) die "unknown add flag: $1" ;;
+      *) [[ -z "$input" ]] || die "usage: swarm add <path> [--name <name>]"; input="$1"; shift ;;
+    esac
+  done
+  [[ -n "$input" ]] || die "usage: swarm add <path> [--name <name>]"
+  path="$(realpath -e -- "$input")" || die "path does not exist: $input"
   is_checkout_root "$path" || die "not a Git checkout root: $path"
   require_main_checkout "$path"
-  [[ "$path" == "$REPOS_DIR/"* ]] || die "repo must be beneath the workspace repo root: $REPOS_DIR"
-  repo="${path#"$REPOS_DIR"/}"
-  validate_repo_name "$repo"
-  [[ "$CONFIG_VERSION" != 2 || "$repo" != .swarm && "$repo" != .swarm/* ]] || die "cannot register a repo inside Swarm state"
-  if repo_authorized "$repo"; then
-    info "Already registered: $repo"
-    return
+  [[ "$path" == "$SWARM_ROOT" || "$path" == "$SWARM_ROOT/"* ]] || die "repo is outside the workspace: $path"
+  [[ "$path" != "$STATE_DIR" && "$path" != "$STATE_DIR/"* ]] || die "cannot register a repo inside Swarm state"
+  relative="$(realpath --relative-to="$SWARM_ROOT" "$path")"
+  for existing in "${REPOS_LIST[@]}"; do
+    if [[ "$(repo_abs "$existing")" == "$path" ]]; then
+      [[ "$explicit" == 0 || "$name" == "$existing" ]] || die "checkout is already registered as $existing"
+      info "Already registered: $existing ($relative)"; return
+    fi
+  done
+  if [[ "$explicit" == 0 ]]; then
+    [[ -t 0 ]] || die "naming requires a terminal; use swarm add <path> --name <name> in scripts"
+    local answer default="$(basename "$path")"
+    while true; do
+      printf 'What do you want to name this repo? [%s]\nPress Enter to use the repo folder name: ' "$default" >&2
+      read -r answer || die "registration cancelled"
+      name="${answer:-$default}"
+      if ! valid_repo_name "$name"; then warn "invalid repo name: $name"; continue; fi
+      if repo_authorized "$name"; then warn "repo name already registered: $name"; continue; fi
+      break
+    done
   fi
-  # Serialize registration updates and rename a sibling tempfile atomically.
+  validate_repo_name "$name"
   (
     flock -x 9
-    if jq -e --arg repo "$repo" '.repos | index($repo) != null' "$SWARM_CONFIG_PATH" >/dev/null; then
-      info "Already registered: $repo"
-      exit 0
-    fi
+    # Reload under the lock to detect concurrent registrations.
+    load_swarm_config_from_path
+    for existing in "${REPOS_LIST[@]}"; do
+      if [[ "$(repo_abs "$existing")" == "$path" ]]; then
+        [[ "$existing" == "$name" ]] || die "checkout already registered as $existing"
+        info "Already registered: $existing ($relative)"; exit 0
+      fi
+    done
+    repo_authorized "$name" && die "repo name already registered: $name; choose --name explicitly"
     tmp="$(mktemp "$SWARM_ROOT/.swarm-config.XXXXXX")"
     trap 'rm -f "$tmp"' EXIT
-    jq --arg repo "$repo" '.repos += [$repo]' "$SWARM_CONFIG_PATH" > "$tmp"
+    jq --arg name "$name" --arg relative "$relative" '.repos[$name] = $relative' "$SWARM_CONFIG_PATH" > "$tmp"
     chmod --reference="$SWARM_CONFIG_PATH" "$tmp"
     mv -- "$tmp" "$SWARM_CONFIG_PATH"
-    info "Registered: $repo"
+    info "Registered: $name ($relative)"
   ) 9>"$STATE_DIR/config.lock"
 }
 
@@ -98,10 +124,10 @@ status_tables() {
   local repo canon wt branch line health count id dirty kind size record primary
   local summaries=() details=() seen=()
   summaries+=($'REPO\tHEALTH\tLINKED WORKTREES')
-  details+=($'REPO\tCHECKOUT / WORKTREE\tBRANCH\tGIT\tSWARM\tHEALTH\tSIZE')
+  details+=($'REPO\tWORK ID\tCHECKOUT / WORKTREE\tBRANCH\tGIT\tSWARM\tHEALTH\tSIZE')
   for repo in "${REPOS_LIST[@]}"; do
     [[ -z "$selected" || "$repo" == "$selected" ]] || continue
-    canon="$REPOS_DIR/$repo"
+    canon="$(repo_abs "$repo")"
     health=OK; count=0
     if ! is_checkout_root "$canon"; then
       health=MISSING/INVALID
@@ -129,6 +155,8 @@ status_tables() {
           else count=$((count+1)); fi
           if id="$(managed_id_for_path "$repo" "$wt")"; then
             kind=ACTIVE
+            local previous
+            for previous in "${seen[@]}"; do [[ "$previous" != "$id" ]] || record=DUPLICATE; done
             seen+=("$id")
           fi
           dirty=unknown
@@ -138,8 +166,8 @@ status_tables() {
           else record=MISSING/INVALID; fi
           size=unknown
           if [[ "$list_only" != 1 && "$record" != MISSING/INVALID ]]; then size="$(checkout_size "$wt" "$scan" "$refresh")"; fi
-          if [[ "$list_only" != 1 || -n "$id" ]]; then
-            details+=("$repo"$'\t'"${wt#"$SWARM_ROOT"/}"$'\t'"$branch"$'\t'"$dirty"$'\t'"$kind"$'\t'"$record"$'\t'"$size")
+          if [[ "$list_only" != 1 || "$kind" != CANONICAL ]]; then
+            details+=("$repo"$'\t'"${id#*___}"$'\t'"${wt#"$SWARM_ROOT"/}"$'\t'"$branch"$'\t'"$dirty"$'\t'"$kind"$'\t'"$record"$'\t'"$size")
           fi
           wt="" ;;
       esac
@@ -149,13 +177,12 @@ status_tables() {
   local marker found entry
   while IFS= read -r -d '' marker; do
     id="${marker#"$SUBMISSIONS_DIR"/}"
-    if [[ "$id" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]+__(.+__.+)$ ]]; then id="${BASH_REMATCH[1]}"; fi
-    repo="${id%%__*}"
+    repo="${id%%___*}"
     [[ -z "$selected" || "$selected" == "$repo" ]] || continue
     found=0
     for entry in "${seen[@]}"; do [[ "$entry" != "$id" ]] || found=1; done
     if [[ "$found" == 0 ]]; then
-      details+=("$repo"$'\t'"$id"$'\t-\tunknown\tSUBMITTED\tORPHAN\tunknown')
+      details+=("$repo"$'\t'"${id#*___}"$'\t'"$id"$'\t-\tunknown\tSUBMITTED\tORPHAN\tunknown')
     fi
   done < <(find "$SUBMISSIONS_DIR" -type f -print0)
   info "Workspace: $SWARM_ROOT"
@@ -171,33 +198,16 @@ cmd_status() {
       --sizes) scan=1 ;;
       --refresh-sizes) scan=1; refresh=1 ;;
       -*) die "unknown status flag: $1" ;;
-      *) [[ -z "$selected" ]] || die "usage: swarm status [repo-path] [--sizes | --refresh-sizes]"
+      *) [[ -z "$selected" ]] || die "usage: swarm status [repo-name] [--sizes | --refresh-sizes]"
          selected="$1" ;;
     esac
     shift
   done
   if [[ -n "$selected" ]]; then
     selected="$(resolve_repo_selector "$selected")"
-    if ! repo_authorized "$selected"; then
-      local resolved
-      resolved="$(realpath -m "$selected")"
-      selected="${resolved#"$REPOS_DIR"/}"
-    fi
     repo_authorized "$selected" || die "repo not registered: $selected"
   fi
   status_tables "$selected" "$scan" "$refresh"
-}
-
-resolve_repo_selector() {
-  local arg="$1" resolved
-  if repo_authorized "$arg"; then printf '%s' "$arg"; return; fi
-  if [[ -n "$LEGACY_REPOS_PREFIX" ]] && repo_authorized "$LEGACY_REPOS_PREFIX/$arg"; then
-    printf '%s/%s' "$LEGACY_REPOS_PREFIX" "$arg"; return
-  fi
-  resolved="$(realpath -m "$arg")"
-  arg="${resolved#"$REPOS_DIR"/}"
-  if repo_authorized "$arg"; then printf '%s' "$arg"; return; fi
-  return 1
 }
 
 # Swarm owns one fixed runtime directory; no legacy checkout ignore rules.
