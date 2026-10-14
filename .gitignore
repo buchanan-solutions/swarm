@@ -3,3 +3,6 @@ combined.txt
 
 # disposable local sandbox for developing the CLI (see docs/DEVELOPMENT.md)
 /test/
+
+# Python CLI test bytecode
+__pycache__/

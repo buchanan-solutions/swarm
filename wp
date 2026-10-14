@@ -3,7 +3,7 @@
 # Prefer ./swarm/swarm for agent/human workflows. Not a public CLI.
 set -euo pipefail
 
-WP_VERSION="0.1.0"
+WP_VERSION="0.2.0"
 
 # ---------------------------------------------------------------------------
 # Paths / config
@@ -89,17 +89,15 @@ validate_work_id() {
   [[ "$id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid work-id (use ticket id or short slug): $id"
 }
 
-validate_repo_name() {
-  local repo="$1"
-  [[ -n "$repo" ]] || die "repo is empty"
-  [[ "$repo" != *"/"* && "$repo" != *"__"* ]] || die "repo must be a bare name under services/ (got: $repo)"
-  [[ "$repo" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid repo name: $repo"
-}
+source "$DEPLOY_ROOT/lib/repos.sh"
 
 canonical_repo_path() {
   local repo="$1"
   validate_repo_name "$repo"
-  local path="$SERVICES_DIR/$repo"
+  local path
+  path="$(safe_repo_path "$repo" "$SERVICES_DIR")"
+  is_checkout_root "$path" || die "not a Git checkout: $path"
+  require_main_checkout "$path"
   [[ -d "$path" ]] || die "repo not found: $path"
   [[ -e "$path/.git" || -d "$path/.git" ]] || die "not a git repository: $path"
   printf '%s\n' "$path"
@@ -123,9 +121,7 @@ resolve_worktree_arg() {
     # Strip optional services/ prefix
     local base="${arg#services/}"
     base="${base%/}"
-    if [[ "$base" == *"/"* ]]; then
-      die "unexpected path in worktree id: $arg"
-    fi
+    validate_repo_name "${base%%__*}"
     path="$SERVICES_DIR/$base"
   elif [[ "$arg" == */* ]]; then
     # repo/work-id
@@ -148,7 +144,7 @@ parse_repo_work_from_path() {
   # Sets: _repo _work_id from .../repo__work-id
   local path="$1"
   local base
-  base="$(basename "$path")"
+  base="${path#"$SERVICES_DIR"/}"
   [[ "$base" == *"__"* ]] || die "path is not a WP worktree (expected <repo>__<work-id>): $path"
   _repo="${base%%__*}"
   _work_id="${base#*__}"
@@ -161,7 +157,7 @@ is_registered_worktree() {
   abs="$(cd "$wt_path" 2>/dev/null && pwd)" || return 1
   git -C "$repo_path" worktree list --porcelain | awk -v p="$abs" '
     $1 == "worktree" {
-      if ($2 == p) found=1
+      if (substr($0, 10) == p) found=1
     }
     END { exit found ? 0 : 1 }
   '
