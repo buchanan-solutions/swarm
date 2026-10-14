@@ -286,6 +286,73 @@ class Workspace(unittest.TestCase):
         self.assertIn('SUBMITTED', self.runcli('status').stdout)
         self.runcli('check', str(wt))
 
+    def test_local_skill_installation_paths_and_preservation(self):
+        repo = self.register('services/ts-mono')
+        before = (self.root / 'swarm.json').read_bytes()
+        md = (self.root / 'swarm.md').read_bytes()
+        self.runcli('install', '--cursor', '--claude', '--codex', cwd=repo)
+        for folder in ['.cursor', '.claude', '.agents']:
+            local = repo / folder / 'skills/swarm/SKILL.md'
+            self.assertTrue(local.is_file())
+            self.assertFalse((self.root / folder / 'skills/swarm/SKILL.md').exists())
+        local = repo / '.cursor/skills/swarm/SKILL.md'
+        local.write_text('custom instructions')
+        self.runcli('install', '--cursor', cwd=repo)
+        self.assertEqual(local.read_text(), 'custom instructions')
+        self.assertEqual(before, (self.root / 'swarm.json').read_bytes())
+        self.assertEqual(md, (self.root / 'swarm.md').read_bytes())
+        other = self.repo('deep/other folder')
+        self.runcli('install', '--codex', '../deep/other folder', cwd=repo.parent)
+        self.assertTrue((other / '.agents/skills/swarm/SKILL.md').is_file())
+        self.runcli('install', 'does-not-exist', '--cursor', ok=False)
+        self.assertFalse((self.root / 'does-not-exist').exists())
+        self.runcli('install', '--codex', str(other / 'hello'), ok=False)
+        self.runcli('install', str(other), ok=False)
+        invalid = other / '.cursor/skills/swarm/SKILL.md'
+        invalid.mkdir(parents=True)
+        self.runcli('install', str(other), '--cursor', ok=False)
+
+    def test_parent_skill_confirmation_yes_no_and_noninteractive(self):
+        repo = self.register('services/ts-mono')
+        self.runcli('install', '--cursor')
+        parent_skill = self.root / '.cursor/skills/swarm/SKILL.md'
+        original = parent_skill.read_bytes()
+        failed = self.runcli('install', '--cursor', cwd=repo, ok=False)
+        self.assertIn(str(parent_skill), failed.stderr)
+        self.assertIn('--yes', failed.stderr)
+        local = repo / '.cursor/skills/swarm/SKILL.md'
+        self.assertFalse(local.exists())
+        for answer in [b'n\n', b'y\n']:
+            master, slave = pty.openpty()
+            proc = subprocess.Popen([CLI, 'install', '--cursor'], cwd=repo, env=ENV,
+                                    stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            os.close(slave); os.write(master, answer)
+            out, err = proc.communicate(timeout=15); os.close(master)
+            self.assertEqual(proc.returncode, 0, out + err)
+            self.assertEqual(local.exists(), answer == b'y\n')
+        local.unlink()
+        self.runcli('install', 'services/ts-mono', '--cursor', '--yes')
+        self.assertTrue(local.is_file())
+        self.assertEqual(original, parent_skill.read_bytes())
+        self.runcli('install', '--claude', '--codex')
+        self.runcli('install', '.', '--claude', '--codex', '--yes', cwd=repo)
+        self.assertTrue((repo / '.claude/skills/swarm/SKILL.md').exists())
+        self.assertTrue((repo / '.agents/skills/swarm/SKILL.md').exists())
+
+    def test_skills_without_workspace_and_in_generated_worktree(self):
+        with tempfile.TemporaryDirectory(prefix='swarm-skills-') as folder:
+            self.runcli('install', '--cursor', '--claude', '--codex', cwd=folder)
+            self.assertFalse((pathlib.Path(folder) / 'swarm.json').exists())
+            self.assertFalse((pathlib.Path(folder) / 'swarm.md').exists())
+        repo = self.register('services/api')
+        self.runcli('install', '--cursor', '--codex')
+        self.runcli('create', 'feature', cwd=repo)
+        wt = self.root / '.swarm/worktrees/services/api__feature'
+        self.runcli('install', '--cursor', '--codex', '--yes', cwd=wt)
+        self.assertTrue((wt / '.cursor/skills/swarm/SKILL.md').is_file())
+        self.assertTrue((wt / '.agents/skills/swarm/SKILL.md').is_file())
+        self.assertFalse((wt / 'swarm.json').exists())
+
     def test_config_boundaries_and_legacy(self):
         self.register('legacy')
         self.runcli('create', 'legacy', 'one')

@@ -134,41 +134,47 @@ worktrees are rejected with their main checkout path.
 initialize the current directory if none exists. `swarm init` explicitly initializes
 the current directory, without that interactive offer.
 
-## Cursor
+## Install skills in the directory your agent opens
 
-To initialize/configure the workspace and install the Swarm skill for Cursor:
+Skill installation targets the current directory, or an explicit directory
+relative to it. It does not initialize a workspace, change the ancestor config,
+or update that workspace's `swarm.md` or managed ignore block.
 
 ```bash
+cd ~/git/my-project
 swarm install --cursor
-```
-
-This installs a workspace-owned copy of the Swarm skill under:
-
-```text
-.cursor/skills/swarm/
-```
-
-Existing installed skill contents are not overwritten.
-
-## Claude
-
-For Claude:
-
-```bash
 swarm install --claude
+swarm install --codex
+# All three:
+swarm install --cursor --claude --codex
+# From a parent directory:
+swarm install services/ts-mono --cursor
 ```
 
-The skill is installed under:
+Destinations beneath the target:
 
-```text
-.claude/skills/swarm/
-```
+- Cursor: `.cursor/skills/swarm/SKILL.md`
+- Claude: `.claude/skills/swarm/SKILL.md`
+- Codex: `.agents/skills/swarm/SKILL.md`
 
-For both:
+Codex's repository skill directory follows the [official skill documentation](https://learn.chatgpt.com/docs/build-skills).
+
+If the same skill is found in a parent directory, installation prints that path
+and asks `Install the <agent> skill here too? [y/N]:`. A no answer skips that copy.
+Noninteractive installation fails when confirmation is needed unless `--yes`
+is supplied:
 
 ```bash
-swarm install --cursor --claude
+swarm install services/ts-mono --cursor --codex --yes
 ```
+
+Existing local `SKILL.md` files are never overwritten, including with `--yes`.
+To refresh one, rename or back it up, then rerun installation. Install directly
+inside a generated worktree if that is the folder your agent opens; copies in
+the parent workspace do not replace local copies.
+
+`swarm install --path` remains Bash PATH setup only. A bare `swarm install`
+retains the existing workspace discovery and interactive initialization behavior.
 
 ## First-time setup
 
@@ -193,6 +199,7 @@ swarm --version
 cd ~/git
 swarm init
 swarm add my-project
+cd my-project
 swarm install --cursor
 ```
 

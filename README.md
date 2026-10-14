@@ -77,23 +77,28 @@ Then, from the workspace folder containing the repos you want to use with Swarm:
 swarm install
 ```
 
-For Cursor:
+Install agent skills into the **current directory**, independently of the Swarm root:
 
 ```bash
-swarm install --cursor
+cd services/ts-mono
+swarm install --cursor --claude --codex
 ```
 
-For Claude:
+Or select a target relative to your current directory:
 
 ```bash
-swarm install --claude
+swarm install services/ts-mono --cursor
+swarm install ../other-repo --claude --codex
 ```
 
-Or both:
+Destinations are `.cursor/skills/swarm/`, `.claude/skills/swarm/`, and
+`.agents/skills/swarm/` (Codex). The target directory must already exist.
+Skill flags do not initialize a workspace or update ancestor workspace files.
+If a matching skill exists in a parent directory, Swarm shows its path and asks
+whether to install another copy at the target. Use `--yes` to accept that prompt
+in scripts; existing skills at the destination are always preserved.
 
-```bash
-swarm install --cursor --claude
-```
+Without skill flags, `swarm install` still configures the discovered workspace.
 
 If Swarm cannot find an existing workspace, it will offer to initialize the current directory:
 
@@ -104,6 +109,8 @@ Configure /home/me/code/project as a new Swarm root? [Y/n]:
 ```
 
 Installation is idempotent. Existing workspace configuration and installed skills are left alone.
+To refresh a customized local skill, back up or rename its `SKILL.md` first, then
+rerun the appropriate install command.
 
 ## Workspace
 
@@ -262,7 +269,7 @@ Being behind trunk is not, by itself, a problem.
 swarm init
 swarm add <path>
 swarm migrate [--dry-run]
-swarm install [--path] [--cursor] [--claude]
+swarm install [directory] [--path] [--cursor] [--claude] [--codex] [--yes]
 swarm config
 
 swarm create <repo> <work-id> [branch] [--from <ref>] [--track <remote-branch>]
@@ -372,6 +379,7 @@ swarm --version
 
 mkdir -p test
 cd test
+swarm init
 swarm install --cursor
 ```
 

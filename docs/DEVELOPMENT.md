@@ -50,6 +50,7 @@ From the repository root:
 ```bash
 mkdir -p test
 cd test
+swarm init
 swarm install --cursor
 ```
 
@@ -58,6 +59,7 @@ Or without the temporary PATH:
 ```bash
 mkdir -p test
 cd test
+../swarm init
 ../swarm install --cursor
 ```
 
@@ -87,6 +89,7 @@ swarm --version
 mkdir -p test
 cd test
 
+swarm init
 swarm install --cursor
 swarm config
 swarm list
@@ -126,7 +129,9 @@ swarm install --claude
 swarm install --cursor --claude
 ```
 
-Repeated invocation is useful for verifying installer idempotency.
+Repeated invocation is useful for verifying installer idempotency. Skill flags
+install into the current directory, independently of ancestor workspace discovery.
+Use an explicit target path and `--yes` when testing intentional parent duplicates.
 
 ## Automated CLI verification
 

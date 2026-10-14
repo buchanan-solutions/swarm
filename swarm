@@ -254,7 +254,7 @@ Bootstrap:
   swarm install --path
   swarm install --cursor
   swarm install --claude
-  swarm install --cursor --claude
+  swarm install [directory] --cursor --claude --codex [--yes]
   swarm install --path --cursor --claude
 
 Read-only:
@@ -276,7 +276,9 @@ Human writes:
 
 Agents MUST NOT run: integrate, remove
 
-install: ensure jq, discover or initialize workspace, optionally copy skills.
+install: ensure jq and discover or initialize workspace.
+install [directory] --cursor/--claude/--codex: copy skills locally (default: current directory).
+Existing local skills are preserved; parent duplicates prompt (use --yes for scripts).
 install --path: manage a Swarm-owned PATH block in ~/.bashrc (Bash only).
 swarm config: print resolved root, swarm.json, and swarm.md.
 
@@ -1146,10 +1148,10 @@ EOF
 }
 
 install_skill_copy() {
-  # $1 = relative dest under SWARM_ROOT e.g. .cursor/skills/swarm
+  # $1 = relative skill destination beneath INSTALL_TARGET.
   # $2 = label e.g. Cursor
   local rel="$1" label="$2"
-  local dest="$SWARM_ROOT/$rel"
+  local dest="$INSTALL_TARGET/$rel"
   local dest_skill="$dest/SKILL.md"
 
   [[ -f "$SKILL_TEMPLATE" ]] || die "canonical skill template missing: $SKILL_TEMPLATE"
@@ -1162,14 +1164,38 @@ install_skill_copy() {
 Remove or resolve it manually before rerunning installation."
   fi
 
-  if [[ -f "$dest_skill" ]]; then
-    info "  ✓ $label skill already installed"
+  if [[ -e "$dest_skill" || -L "$dest_skill" ]]; then
+    [[ -f "$dest_skill" ]] || die "skill destination is not a regular file: $dest_skill"
+    info "  ✓ $label skill already installed at $dest_skill (left unchanged)"
     return 0
   fi
 
+  local parent ancestor=""
+  parent="$(dirname "$INSTALL_TARGET")"
+  while [[ "$parent" != "$INSTALL_TARGET" ]]; do
+    if [[ -f "$parent/$rel/SKILL.md" ]]; then ancestor="$parent/$rel/SKILL.md"; break; fi
+    [[ "$parent" != / ]] || break
+    parent="$(dirname "$parent")"
+  done
+  if [[ -n "$ancestor" ]]; then
+    warn "$label skill already exists in a parent directory: $ancestor"
+    info "  Target: $dest_skill"
+    if [[ "$INSTALL_YES" != 1 ]]; then
+      if [[ ! -t 0 ]]; then
+        die "confirmation required to install another $label skill here; rerun interactively or pass --yes"
+      fi
+      local answer
+      printf 'Install the %s skill here too? [y/N]: ' "$label" >&2
+      read -r answer || answer=""
+      case "$answer" in
+        y|Y|yes|YES|Yes) ;;
+        *) info "  · $label skill installation skipped"; return 0 ;;
+      esac
+    fi
+  fi
   mkdir -p "$dest"
-  cp "$SKILL_TEMPLATE" "$dest_skill"
-  info "  ✓ $label $rel"
+  cp -n "$SKILL_TEMPLATE" "$dest_skill"
+  info "  ✓ $label $dest_skill"
 }
 
 # Managed block markers (owned exclusively by Swarm) for ~/.bashrc and .gitignore.
@@ -1417,23 +1443,35 @@ Swarm manages a block in ~/.bashrc and will not edit other shell rc files."
 }
 
 cmd_install() {
-  local want_path=0 want_cursor=0 want_claude=0
+  local want_path=0 want_cursor=0 want_claude=0 want_codex=0 target=""
+  local install_usage='usage: swarm install [directory] [--path] [--cursor] [--claude] [--codex] [--yes]'
+  INSTALL_TARGET=""
+  INSTALL_YES=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --path) want_path=1; shift ;;
       --cursor) want_cursor=1; shift ;;
       --claude) want_claude=1; shift ;;
+      --codex) want_codex=1; shift ;;
+      --yes|-y) INSTALL_YES=1; shift ;;
+      --) shift; [[ $# -eq 1 && -z "$target" ]] || die "$install_usage"; target="$1"; shift ;;
       -*) die "unknown flag: $1
-usage: swarm install [--path] [--cursor] [--claude]" ;;
-      *) die "unexpected argument: $1
-usage: swarm install [--path] [--cursor] [--claude]" ;;
+$install_usage" ;;
+      *) [[ -z "$target" ]] || die "$install_usage"; target="$1"; shift ;;
     esac
   done
+  local skills=$((want_cursor + want_claude + want_codex))
+  if [[ -n "$target" || "$INSTALL_YES" == 1 ]]; then
+    [[ "$skills" -gt 0 ]] || die "directory and --yes require a skill flag
+$install_usage"
+  fi
+  INSTALL_TARGET="$(realpath -e -- "${target:-.}")" || die "installation directory does not exist: $target"
+  [[ -d "$INSTALL_TARGET" ]] || die "installation target is not a directory: $INSTALL_TARGET"
 
   # --path alone: only manage shell PATH (do not init a workspace in the CLI checkout).
-  # Combined with --cursor/--claude: PATH plus normal workspace/skill install.
+  # Combined with skill flags: PATH plus target-local skill installation.
   local path_only=0
-  if [[ "$want_path" -eq 1 && "$want_cursor" -eq 0 && "$want_claude" -eq 0 ]]; then
+  if [[ "$want_path" -eq 1 && "$skills" -eq 0 ]]; then
     path_only=1
   fi
 
@@ -1448,6 +1486,16 @@ usage: swarm install [--path] [--cursor] [--claude]" ;;
       return 0
     fi
     info ""
+  fi
+
+  # Skill installation is local to its target, independent of workspace setup.
+  if [[ "$skills" -gt 0 ]]; then
+    info "Skills: $INSTALL_TARGET"
+    if [[ "$want_cursor" == 1 ]]; then install_skill_copy .cursor/skills/swarm Cursor; fi
+    if [[ "$want_claude" == 1 ]]; then install_skill_copy .claude/skills/swarm Claude; fi
+    if [[ "$want_codex" == 1 ]]; then install_skill_copy .agents/skills/swarm Codex; fi
+    info "Swarm skill installation complete."
+    return 0
   fi
 
   ensure_jq_dependency
@@ -1466,18 +1514,6 @@ usage: swarm install [--path] [--cursor] [--claude]" ;;
   ensure_gitignore_swarm_block
   ensure_swarm_md
 
-  if [[ "$want_cursor" -eq 1 || "$want_claude" -eq 1 ]]; then
-    info ""
-    info "Skills"
-    if [[ "$want_cursor" -eq 1 ]]; then
-      install_skill_copy ".cursor/skills/swarm" "Cursor"
-    fi
-    if [[ "$want_claude" -eq 1 ]]; then
-      install_skill_copy ".claude/skills/swarm" "Claude"
-    fi
-  fi
-
-  info ""
   info "Swarm ready."
 }
 
