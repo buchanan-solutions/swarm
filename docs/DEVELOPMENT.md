@@ -41,7 +41,7 @@ Editing `./swarm` immediately changes what the `swarm` command executes. There i
 
 Do **not** initialize the Swarm source repository itself as a Swarm workspace merely to develop or test the CLI.
 
-Use the ignored `test/` child directory instead. That keeps development artifacts such as `swarm.json`, `swarm.md`, `.swarm/`, `.cursor/`, `.claude/`, and temporary repositories out of the public source tree.
+Use the ignored `test/` child directory instead. That keeps development artifacts such as `swarm.json`, `swarm.md`, `.swarm/`, `.cursor/`, `.claude/`, `.agents/`, and temporary repositories out of the public source tree.
 
 ## Create the disposable test workspace
 
@@ -121,12 +121,12 @@ This should still resolve `test/swarm.json` as the active Swarm configuration.
 
 ## Testing skill integrations
 
-Exercise either or both installer integrations:
+Exercise the shared skill installers:
 
 ```bash
 swarm install --cursor
 swarm install --claude
-swarm install --cursor --claude
+swarm install --cursor --claude --codex
 ```
 
 Repeated invocation is useful for verifying installer idempotency. Skill flags
@@ -138,10 +138,40 @@ Use an explicit target path and `--yes` when testing intentional parent duplicat
 ```bash
 bash -n swarm wp lib/*.sh
 python3 tests/workspace.py -v
+git diff --check
 ```
 
-Tests create disposable repositories under the system temp directory, use local
-remotes only, and exercise nested registration, submodules, warnings, cached
-sizes, and the worktree lifecycle including interactive removal through a PTY.
-They also cover v1 migration, custom state directories, active submissions,
-legacy sibling checkouts, and centralized v2 worktrees.
+Tests create disposable repositories under the system temp directory and use local
+remotes only. PTYs exercise naming prompts, cancellation, parent-skill confirmation,
+and interactive removal. Fake launcher executables capture argv and working directory;
+tests do not open real editors or agents.
+
+Coverage includes explicit/inferred targets, root checkouts, submodules, external and
+missing worktrees, default IDE selection, cached sizes, target-local skills, both old
+config shapes, naming collisions, active submissions, custom state, and interrupted
+migration retries.
+
+## Final v2 schema and identity
+
+```json
+{
+  "version": 2,
+  "default_ide": "",
+  "repos": {"api": "services/api"}
+}
+```
+
+Repo names are stable identifiers; paths are workspace-relative and may be `"."`.
+Use `swarm add services/api --name api` in automated fixtures. New identities are
+`api___1234`; new paths are `.swarm/worktrees/api___1234`. Git's registry owns the
+active checkout list. `.swarm/migration/` holds static source config, chosen names,
+submission snapshots, and a temporary recovery journal, not an activity database.
+
+`lib/repos.sh` shares identity and path rules with the internal `wp` create/sync
+helper. The public CLI resolves repo names, context, targets, and launchers. Both
+version 1 and early-v2 array fixtures must pass through explicit `swarm migrate`;
+normal commands reject those shapes. No version 3 is introduced.
+
+The release checks are Bash syntax, all integration tests, and `git diff --check`.
+Keep help, README, installation docs, and the shared agent skill consistent. Project
+`swarm.md` and customized installed skills must not be overwritten by upgrades.

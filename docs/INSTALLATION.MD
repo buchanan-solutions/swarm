@@ -6,7 +6,7 @@ Installation is intentionally simple:
 
 1. Clone the repository.
 2. Add the Swarm executable to your `PATH`.
-3. Run `swarm init` in a parent workspace, then `swarm add <path>` for each repo.
+3. Run `swarm init` in a parent workspace, then `swarm add <path>` for each repo, choosing a unique name when prompted.
 
 ## Clone Swarm
 
@@ -124,9 +124,13 @@ swarm create task-123
 
 `swarm init` creates an empty `swarm.json`, optional instructions in `swarm.md`,
 and ignored runtime state in `.swarm`. New worktrees live under `.swarm/worktrees/`.
-The config is simply `{"version": 2, "repos": []}`. Repeating initialization preserves config.
+The initial config is `{"version": 2, "default_ide": "", "repos": {}}`. Repeating initialization preserves config.
 Registration resolves the argument relative to your current directory and records
 its normalized path relative to the folder containing `swarm.json`. Standard Bash directory completion works.
+Registration prompts `What do you want to name this repo? [api]`; Enter accepts
+the target folder name. Duplicate or invalid names prompt again. Scripts use
+`swarm add <path> --name api`. Re-adding a registered checkout reports its existing
+name without prompting; the same checkout cannot have multiple names.
 Only explicitly registered repos are managed. Submodules are supported; linked
 worktrees are rejected with their main checkout path.
 
@@ -208,7 +212,7 @@ After that, Swarm is available normally:
 ```bash
 swarm config
 swarm list
-swarm create <repo> <work-id>
+swarm create <repo-name> <work-ID>
 ```
 
 ## Updating Swarm
@@ -236,9 +240,9 @@ Contributing to Swarm itself is slightly different: contributors can temporarily
 
 See `docs/DEVELOPMENT.md`.
 
-## Existing version 1 workspaces
+## Upgrade version 1 or early version 2 configs
 
-Run from the workspace or a registered checkout:
+Run from anywhere beneath the workspace:
 
 ```bash
 swarm migrate --dry-run
@@ -246,11 +250,63 @@ swarm migrate
 swarm status
 ```
 
-Migration prefixes repo paths with the old `repos_dir`, removes both directory
-properties, and fixes local state at `.swarm`. Existing worktrees remain in place;
-new worktrees use `.swarm/worktrees/<repo-path>__<work-id>`. Active submissions and
-project instructions are preserved. Original config and inbox snapshots are kept
-under `.swarm/migration-v1/`. Old custom state directories are retained.
-The managed ignore block contains only `.swarm/`; Swarm's broad `*__*/` rule
-and legacy-path ignore entries are removed. User-owned rules outside that block
-are preserved.
+Both old versions have a `repos` array. Migration keeps schema version 2 but replaces
+that array with a unique-name-to-path object. Each registered repo is displayed with
+its resolved path and a naming prompt; Enter accepts the folder name. Collisions and
+invalid names prompt again. Cancellation leaves config and submissions unchanged.
+`swarm migrate --yes` accepts valid unique defaults in scripts; duplicate defaults
+require an interactive run. Dry-run previews defaults and conflicts without changes.
+
+V1's `repos_dir` is folded into workspace-relative paths and both old directory
+properties are removed. `default_ide` is initialized to an empty string if absent.
+Original config, chosen naming plan, and submission snapshots are backed up in
+`.swarm/migration/`. Active markers adopt `<repo-name>___<work-ID>` identities;
+old custom state directories and project-owned `swarm.md` are preserved.
+
+Existing worktrees remain where they are; Swarm finds them through Git and the
+migration snapshot. Creating the same repo/work pair reuses its existing checkout.
+New checkouts use `.swarm/worktrees/<repo-name>___<work-ID>`. Migration can safely
+resume after interruption. Old path-based command aliases are not retained.
+
+The managed ignore block contains only `.swarm/`. No broad `*__*/` rule or legacy
+checkout exceptions are retained. User-owned rules outside that block are preserved.
+Review your project-specific naming examples in `swarm.md` after migration.
+
+## Navigation and launch defaults
+
+```bash
+swarm path ts-mono
+swarm path ts-mono 1234
+cd "$(swarm path ts-mono 1234)"
+swarm open ts-mono 1234 --cursor
+```
+
+Inside the registered repo or one of its managed worktrees, omit the repo name:
+
+```bash
+swarm open 1234 --cursor
+```
+
+Set `"default_ide": "cursor"` in `swarm.json` to omit the flag as well. Supported
+values are `""`, `"cursor"`, `"claude"`, and `"codex"`; an omitted property also
+means no default. If no default or flag is selected, `open` fails with instructions
+to choose one. Explicit flags override the default. Multiple flags and unavailable
+executables are errors; no launcher fallback or VS Code support is included.
+
+Cursor opens a new window; Claude runs in the selected directory in the foreground;
+Codex uses its working-directory option. Install those tools separately on PATH.
+Opening does not install skills, change permissions, or create background agents.
+
+## Refresh existing skill copies
+
+CLI updates take effect immediately, but installed skill copies are preserved.
+Back up the relevant local file, then reinstall it:
+
+```bash
+mv .cursor/skills/swarm/SKILL.md .cursor/swarm-SKILL.md.backup
+swarm install --cursor
+```
+
+For Claude use `.claude` and `--claude`; for Codex use `.agents` and `--codex`.
+Compare the backup and reapply any custom guidance. Parent duplicates still prompt;
+`--yes` accepts duplication but never overwrites an existing local skill.
