@@ -514,6 +514,7 @@ cmd_list() {
   [[ "$all" == 0 || -z "$explicit" ]] || die "use a repo name or --all, not both"
   if [[ -n "$explicit" ]]; then selected="$(resolve_repo_selector "$explicit")"; fi
   [[ "$all" == 0 ]] || selected=""
+  if [[ -n "$selected" ]]; then require_repo "$selected" >/dev/null; fi
   status_tables "$selected" 0 0 1
 }
 

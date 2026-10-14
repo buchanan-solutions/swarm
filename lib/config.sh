@@ -25,8 +25,6 @@ load_swarm_config_from_path() {
     [[ "$path" != "$STATE_DIR" && "$path" != "$STATE_DIR/"* ]] || die "cannot register a repo inside .swarm: $name"
     for existing in "${paths[@]}"; do [[ "$existing" != "$path" ]] || die "checkout registered under multiple names: $relative"; done
     paths+=("$path"); REPOS_LIST+=("$name")
-    if ! is_checkout_root "$path"; then warn "registered repo is missing or not a Git checkout: $name ($relative)"
-    elif linked_main_checkout "$path" >/dev/null; then warn "registered repo is a linked worktree: $name ($relative)"; fi
   done < <(jq -r '.repos | keys_unsorted[]' "$SWARM_CONFIG_PATH")
   # Validate fixed directory boundaries before creating any runtime state.
   local dir resolved

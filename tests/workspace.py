@@ -164,10 +164,37 @@ class Workspace(unittest.TestCase):
         self.assertIn('MISSING/INVALID', self.runcli('status').stdout)
         self.runcli('create', 'api', 'one', ok=False)
         shutil.rmtree(repo)
-        self.assertIn('warning:', self.runcli('path', 'secondary').stderr)
+        self.assertEqual(self.runcli('path', 'secondary').stderr, '')
+        self.assertIn('warning:', self.runcli('status').stderr)
+        self.assertEqual(self.runcli('status', 'secondary').stderr, '')
+        self.assertEqual(self.runcli('list', '--all').stderr, '')
+        self.assertEqual(self.runcli('config').stderr, '')
+        self.runcli('list', 'api', ok=False)
         self.runcli('create', 'secondary', 'three')
         self.assertNotIn('error:', self.runcli('sync', 'secondary', 'two').stderr)
         self.runcli('path', 'api', ok=False)
+
+    def test_quiet_worktree_paths_with_unavailable_registrations(self):
+        repo = self.register('services/ts-mono', 'ts-mono')
+        self.runcli('create', 'ts-mono', 'monitor')
+        cfg = self.config()
+        cfg['repos'].update({'engine': 'services/engine', 'web': 'services/web'})
+        self.write_config(cfg)
+        (self.root / 'services/engine').mkdir()  # directory exists but is not a repo
+        path = self.runcli('path', 'ts-mono', 'monitor')
+        self.assertEqual(path.stderr, '')
+        self.assertEqual(path.stdout, str(self.wt('ts-mono', 'monitor')) + '\n')
+        self.assertEqual(self.git(path.stdout.strip(), 'status').stderr, '')
+        self.assertEqual(self.runcli('check', 'ts-mono', 'monitor').stderr, '')
+        self.assertEqual(self.runcli('list').stderr, '')
+        health = self.runcli('status')
+        self.assertIn('engine (services/engine)', health.stderr)
+        self.assertIn('web (services/web)', health.stderr)
+        self.assertIn('MISSING/INVALID', health.stdout)
+        for args in [('path', 'engine'), ('path', 'web', 'one'),
+                     ('check', 'engine', 'one'), ('create', 'web', 'one')]:
+            error = self.runcli(*args, ok=False).stderr
+            self.assertTrue('unavailable' in error or 'not found' in error, error)
 
     def test_schema_validation_and_size_cache(self):
         repo = self.register('api')

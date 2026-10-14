@@ -130,11 +130,13 @@ status_tables() {
     canon="$(repo_abs "$repo")"
     health=OK; count=0
     if ! is_checkout_root "$canon"; then
+      if [[ "$list_only" != 1 ]]; then warn "registered repo is missing or not a Git checkout: $repo ($(repo_relative "$repo"))"; fi
       health=MISSING/INVALID
       summaries+=("$repo"$'\t'"$health"$'\t'"?")
       continue
     fi
     if linked_main_checkout "$canon" >/dev/null; then
+      if [[ "$list_only" != 1 ]]; then warn "registered repo is a linked worktree: $repo ($(repo_relative "$repo"))"; fi
       summaries+=("$repo"$'\t'"LINKED-WORKTREE"$'\t'"?")
       continue
     fi

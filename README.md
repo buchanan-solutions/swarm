@@ -225,8 +225,10 @@ as external, without invented work IDs. Missing/prunable checkouts and orphan
 submission markers remain visible. Duplicate managed identities prevent ambiguous
 creation, navigation, or modification; stale metadata prevents replacement creation.
 
-Unavailable canonical repos emit persistent warnings without blocking healthy repos.
-Malformed configuration remains an error. Only targeted unavailable repos block work.
+`swarm status` reports unavailable canonical repos, scoped to its selected repo or
+the whole workspace. Operational commands such as `path`, `list`, and `check` stay
+quiet about unrelated unhealthy registrations. Targeting an unavailable repo fails
+with a focused error. Malformed configuration remains an error.
 
 Normal status does not scan disk usage. `--sizes` measures allocated space, including
 ignored dependencies/builds, and caches it for 24 hours. `--refresh-sizes` forces a scan.

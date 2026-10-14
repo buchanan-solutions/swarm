@@ -64,8 +64,8 @@ underscores. Reserve `___` in identifiers; repo names cannot end in an underscor
 
 `swarm list [repo-name]` selects the current repo by default; `list --all` and
 `swarm status` show the workspace. Git is the worktree source of truth. External
-worktrees have no invented work IDs. Missing registrations warn without blocking
-healthy repos. Missing/prunable or duplicate managed worktrees need human attention.
+worktrees have no invented work IDs. Missing registrations are reported by `status`; ordinary commands stay quiet
+about unrelated repos and fail only when their selected repo is unavailable. Missing/prunable or duplicate managed worktrees need human attention.
 Normal status uses cached sizes; `status --sizes` performs disk scans.
 
 Version 1 and early-v2 array configs require explicit `swarm migrate`. It prompts
