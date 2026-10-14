@@ -8,6 +8,43 @@ No daemon. No database. No scheduler. No replacement for Git.
 
 Just Git worktrees with some opinions.
 
+## Quickstart
+
+Add the **directory containing the executable** to your Bash PATH (adjust the checkout path):
+
+```bash
+export PATH="/home/alex/git/bs/swarm:$PATH"
+```
+
+For future terminals, add that export line to `~/.bashrc`, or use the managed installer:
+
+```bash
+/home/alex/git/bs/swarm/swarm install --path
+source ~/.bashrc
+command -v swarm
+```
+
+Initialize one workspace, then explicitly register repos anywhere beneath it:
+
+```bash
+cd ~/git
+swarm init
+swarm add clients/project/services/api  # normal shell Tab completion works
+
+cd clients/project/services/api
+swarm add .                            # safely reports Already registered
+swarm create task-123                   # infers this registered repo
+swarm list                             # this repo's Swarm worktrees
+swarm list --all                        # all registered repos
+swarm status                           # workspace health and all linked worktrees
+swarm status --sizes                    # measure/cache disk usage, including node_modules
+```
+
+`swarm init` and `swarm add` are idempotent. Initialization enrolls no repos automatically.
+A repo selector is its registered path relative to `repos_dir`, not its remote name.
+Submodules can be registered separately; linked worktrees cannot be initialized or registered.
+There is no reinstall after editing or updating the source checkout on PATH.
+
 ## Why?
 
 Coding agents are very good at working independently.
@@ -34,7 +71,7 @@ Agents work independently. Git handles history. Swarm handles the workspace life
 
 Clone Swarm and put the executable on your `PATH`.
 
-Then, from the project you want to use with Swarm:
+Then, from the workspace folder containing the repos you want to use with Swarm:
 
 ```bash
 swarm install
@@ -93,7 +130,22 @@ Machine-readable workspace topology:
 }
 ```
 
-Repositories can live directly beneath the workspace or under a configured directory such as `services/`.
+Repositories can live at any depth beneath `repos_dir`, including initialized submodules.
+Register them with `swarm add <path>` from anywhere under the workspace. The argument
+is relative to your current directory; config entries are normalized relative to `repos_dir`.
+For example, `"repos": ["clients/project/services/api", "other/api"]`.
+Paths outside `repos_dir`, paths containing `__`, and newline/tab characters are rejected.
+Worktrees live beside each canonical checkout: `clients/project/services/api__task-123`.
+Use the full registered path in workspace-level commands:
+
+```bash
+swarm create clients/project/services/api task-123
+swarm check clients/project/services/api__task-123
+```
+
+Inside that repo, `swarm create task-123` infers the repo. An unregistered nested
+Git repo does not inherit its parent's registration. From a Swarm worktree, the
+basename ID (`api__task-123`) also resolves in the current repo's context.
 
 ### `swarm.md`
 
@@ -298,3 +350,23 @@ See [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) for the contributor workflow.
 ## License
 
 See `LICENSE`.
+
+## Workspace health and disk usage
+
+Workspace-aware commands warn about every missing or invalid registered repo.
+These warnings persist until the registration is corrected; healthy repos remain usable.
+Commands requiring an unavailable repo fail with a specific error.
+
+`swarm status` shows all registered repos, linked-worktree counts, canonical and
+linked checkouts, branches, Git cleanliness, Swarm state, and health. External
+worktrees, missing/prunable worktrees, and orphan submissions are included.
+`swarm status <repo-path>` selects one repo; `swarm list` selects the current repo
+when possible, and `swarm list --all` always lists the whole workspace.
+
+Normal status does not scan disk usage. `swarm status --sizes` measures allocated
+space including ignored dependency/build folders and caches results for 24 hours.
+`--refresh-sizes` forces measurement. Cached values include UTC timestamps;
+unknown/unreadable sizes do not block the report. Measurements are per directory,
+not estimates of reclaimable space. Cache files live under `.swarm/sizes/`.
+
+Runtime requirements: Bash, Git, jq, GNU coreutils, awk, and flock (util-linux).

@@ -6,7 +6,7 @@ Installation is intentionally simple:
 
 1. Clone the repository.
 2. Add the Swarm executable to your `PATH`.
-3. Run `swarm install` inside a project to initialize or configure that workspace.
+3. Run `swarm init` in a parent workspace, then `swarm add <path>` for each repo.
 
 ## Clone Swarm
 
@@ -110,47 +110,28 @@ If only one marker exists, the block is malformed, or Swarm cannot safely identi
 
 Swarm should never overwrite `.bashrc`.
 
-## Initialize a project
-
-Once Swarm is available on your PATH, enter the project you want Swarm to manage:
+## Initialize a workspace and register repos
 
 ```bash
-cd ~/git/my-project
-swarm install
+cd ~/git
+swarm init
+swarm add clients/project/services/api
+# Or from the checkout itself:
+cd clients/project/services/api
+swarm add .
+swarm create task-123
 ```
 
-Swarm searches the current directory and its ancestors for an existing `swarm.json`.
+`swarm init` creates an empty `swarm.json`, optional instructions in `swarm.md`,
+and ignored runtime state in `.swarm`. Repeating initialization preserves config.
+Registration resolves the argument relative to your current directory and records
+its normalized path beneath `repos_dir`. Standard Bash directory completion works.
+Only explicitly registered repos are managed. Submodules are supported; linked
+worktrees are rejected with their main checkout path.
 
-If none exists:
-
-```text
-No Swarm workspace found.
-
-Configure /home/me/git/my-project as a new Swarm root? [Y/n]:
-```
-
-Accepting creates the initial workspace configuration:
-
-```text
-my-project/
-├── swarm.json
-└── swarm.md
-```
-
-A new workspace starts with:
-
-```json
-{
-  "version": 1,
-  "repos_dir": ".",
-  "state_dir": ".swarm",
-  "repos": []
-}
-```
-
-`swarm.md` contains optional workspace-specific instructions for coding agents.
-
-Running `swarm install` again discovers and validates the existing workspace. It does not overwrite `swarm.json` or `swarm.md`.
+`swarm install` still discovers the nearest ancestor workspace and offers to
+initialize the current directory if none exists. `swarm init` explicitly initializes
+the current directory, without that interactive offer.
 
 ## Cursor
 
@@ -207,8 +188,10 @@ source ~/.bashrc
 # Verify
 swarm --version
 
-# Initialize a project
-cd ~/git/my-project
+# Initialize a workspace and enroll a repo
+cd ~/git
+swarm init
+swarm add my-project
 swarm install --cursor
 ```
 

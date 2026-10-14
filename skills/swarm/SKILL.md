@@ -32,11 +32,26 @@ swarm.json   workspace topology (machine-readable)
 swarm.md     optional workspace-specific instructions
 ```
 
-**CLI hygiene:** Prefer read-only commands (`config`, `list`, `check`,
+**CLI hygiene:** Prefer read-only commands (`config`, `list`, `status`, `check`,
 `review`). For writes (`create`, `sync`, `submit`, `integrate`), pass
 `--dry-run` first unless the user explicitly asked you to apply the change.
 `remove` requires `--confirm` and interactive `Y` (optional `-d` for
 `git branch -d` only).
+
+## Repo registration and context
+
+A workspace is initialized with `swarm init`; repos are explicitly enrolled with
+`swarm add <path>` (or `swarm add .` at a checkout root). Registration paths are
+relative to `repos_dir` and may be deeply nested. Submodules are separate repos;
+linked worktrees must not be registered as canonical repos.
+
+Use `swarm config` to see the inferred current repo. `swarm create <work-id>`
+works inside a registered repo; explicit `swarm create <repo-path> <work-id>`
+works anywhere beneath the workspace. Nested worktree IDs include the registered
+path, e.g. `clients/api__123`. Worktrees remain beside their canonical checkout.
+`swarm list` selects the current repo; `swarm list --all` and `swarm status` show
+the workspace. Missing registrations produce warnings without blocking healthy
+repos. `status --sizes` scans disk usage; normal status uses cached values only.
 
 ## Principle
 

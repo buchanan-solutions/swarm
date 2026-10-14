@@ -127,3 +127,14 @@ swarm install --cursor --claude
 ```
 
 Repeated invocation is useful for verifying installer idempotency.
+
+## Automated CLI verification
+
+```bash
+bash -n swarm wp lib/*.sh
+python3 tests/workspace.py -v
+```
+
+Tests create disposable repositories under the system temp directory, use local
+remotes only, and exercise nested registration, submodules, warnings, cached
+sizes, and the worktree lifecycle including interactive removal through a PTY.
