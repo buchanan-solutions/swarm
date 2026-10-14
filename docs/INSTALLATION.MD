@@ -123,9 +123,10 @@ swarm create task-123
 ```
 
 `swarm init` creates an empty `swarm.json`, optional instructions in `swarm.md`,
-and ignored runtime state in `.swarm`. Repeating initialization preserves config.
+and ignored runtime state in `.swarm`. New worktrees live under `.swarm/worktrees/`.
+The config is simply `{"version": 2, "repos": []}`. Repeating initialization preserves config.
 Registration resolves the argument relative to your current directory and records
-its normalized path beneath `repos_dir`. Standard Bash directory completion works.
+its normalized path relative to the folder containing `swarm.json`. Standard Bash directory completion works.
 Only explicitly registered repos are managed. Submodules are supported; linked
 worktrees are rejected with their main checkout path.
 
@@ -227,3 +228,21 @@ to update the managed Bash configuration.
 Contributing to Swarm itself is slightly different: contributors can temporarily add their checkout to `PATH` without modifying their shell configuration.
 
 See `docs/DEVELOPMENT.md`.
+
+## Existing version 1 workspaces
+
+Run from the workspace or a registered checkout:
+
+```bash
+swarm migrate --dry-run
+swarm migrate
+swarm status
+```
+
+Migration prefixes repo paths with the old `repos_dir`, removes both directory
+properties, and fixes local state at `.swarm`. Existing worktrees remain in place;
+new worktrees use `.swarm/worktrees/<repo-path>__<work-id>`. Active submissions and
+project instructions are preserved. Original config and inbox snapshots are kept
+under `.swarm/migration-v1/`. Old custom state directories are retained.
+The managed ignore block keeps exact ignores for old checkouts while removing
+Swarm's broad `*__*/` rule. User-owned rules are preserved.

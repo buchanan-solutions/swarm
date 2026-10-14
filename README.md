@@ -41,7 +41,7 @@ swarm status --sizes                    # measure/cache disk usage, including no
 ```
 
 `swarm init` and `swarm add` are idempotent. Initialization enrolls no repos automatically.
-A repo selector is its registered path relative to `repos_dir`, not its remote name.
+A repo selector is its registered path relative to the folder containing `swarm.json`, not its remote name.
 Submodules can be registered separately; linked worktrees cannot be initialized or registered.
 There is no reinstall after editing or updating the source checkout on PATH.
 
@@ -123,19 +123,19 @@ Machine-readable workspace topology:
 
 ```json
 {
-  "version": 1,
-  "repos_dir": ".",
-  "state_dir": ".swarm",
+  "version": 2,
   "repos": []
 }
 ```
 
-Repositories can live at any depth beneath `repos_dir`, including initialized submodules.
+Repositories can live at any depth beneath the workspace, including initialized submodules.
 Register them with `swarm add <path>` from anywhere under the workspace. The argument
-is relative to your current directory; config entries are normalized relative to `repos_dir`.
+is relative to your current directory; config entries are normalized relative to the folder containing `swarm.json`.
 For example, `"repos": ["clients/project/services/api", "other/api"]`.
-Paths outside `repos_dir`, paths containing `__`, and newline/tab characters are rejected.
-Worktrees live beside each canonical checkout: `clients/project/services/api__task-123`.
+Paths outside the workspace, paths containing `__`, and newline/tab characters are rejected.
+New worktrees live under `.swarm/worktrees/`: `.swarm/worktrees/clients/project/services/api__task-123`.
+State always lives in `.swarm/` beside `swarm.json`; the managed ignore block ignores
+that directory without a broad double-underscore pattern.
 Use the full registered path in workspace-level commands:
 
 ```bash
@@ -146,6 +146,34 @@ swarm check clients/project/services/api__task-123
 Inside that repo, `swarm create task-123` infers the repo. An unregistered nested
 Git repo does not inherit its parent's registration. From a Swarm worktree, the
 basename ID (`api__task-123`) also resolves in the current repo's context.
+
+### Migrating an existing version 1 workspace
+
+Version 1 configs remain supported until explicitly migrated:
+
+```bash
+swarm migrate --dry-run
+swarm migrate
+swarm status
+```
+
+Migration prepends the old `repos_dir` to registrations, removes `repos_dir` and
+`state_dir`, and sets `version` to 2. For example, `"repos_dir": "services"` with
+`"repos": ["ts-mono"]` becomes `"repos": ["services/ts-mono"]`.
+`swarm.md` is preserved unchanged; update its path examples when convenient.
+
+Existing sibling worktrees stay in place and remain usable for check, sync,
+submit, review, integrate, and removal. Creating the same work ID reuses its
+existing checkout; new work IDs use `.swarm/worktrees/`. Duplicate registered
+checkouts for the same identity, or missing checkouts with live metadata, produce
+an error instead of silently creating another checkout.
+
+Active submissions are copied to their version 2 identities. Original config and
+submission snapshots are retained in `.swarm/migration-v1/`. Custom old state
+directories are retained. Swarm's managed ignore block switches to `.swarm/` plus
+precise entries for existing legacy checkouts and any old custom state directory;
+user-owned rules are preserved. Repeating migration is safe. Legacy repo selectors
+such as `ts-mono__1234` remain accepted after migration when unambiguous.
 
 ### `swarm.md`
 
@@ -189,8 +217,8 @@ swarm create ts-mono 2680
 might create:
 
 ```text
-ts-mono/          canonical checkout
-ts-mono__2680/    isolated agent worktree
+ts-mono/                          canonical checkout
+.swarm/worktrees/ts-mono__2680/    isolated agent worktree
 ```
 
 on:
@@ -213,7 +241,7 @@ The trunk manager can then:
 ```bash
 swarm review ts-mono__2680
 swarm integrate ts-mono__2680
-swarm remove ts-mono__2680 -d
+swarm remove ts-mono__2680 --confirm -d
 ```
 
 Integration uses normal Git ancestry and a `--no-ff` merge commit. Swarm does not require routine rebasing.
@@ -231,11 +259,15 @@ Being behind trunk is not, by itself, a problem.
 ## Commands
 
 ```text
-swarm install [--cursor] [--claude]
+swarm init
+swarm add <path>
+swarm migrate [--dry-run]
+swarm install [--path] [--cursor] [--claude]
 swarm config
 
 swarm create <repo> <work-id> [branch] [--from <ref>] [--track <remote-branch>]
-swarm list
+swarm list [--all]
+swarm status [repo-path] [--sizes | --refresh-sizes]
 swarm check <worktree>
 swarm sync <worktree>
 swarm submit <worktree>

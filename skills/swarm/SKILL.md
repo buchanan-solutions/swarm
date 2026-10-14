@@ -40,18 +40,23 @@ swarm.md     optional workspace-specific instructions
 
 ## Repo registration and context
 
-A workspace is initialized with `swarm init`; repos are explicitly enrolled with
+A workspace is initialized with `swarm init` (version 2); repos are explicitly enrolled with
 `swarm add <path>` (or `swarm add .` at a checkout root). Registration paths are
-relative to `repos_dir` and may be deeply nested. Submodules are separate repos;
+relative to the directory containing `swarm.json` and may be deeply nested. Submodules are separate repos;
 linked worktrees must not be registered as canonical repos.
 
 Use `swarm config` to see the inferred current repo. `swarm create <work-id>`
 works inside a registered repo; explicit `swarm create <repo-path> <work-id>`
 works anywhere beneath the workspace. Nested worktree IDs include the registered
-path, e.g. `clients/api__123`. Worktrees remain beside their canonical checkout.
+path, e.g. `clients/api__123`. New worktrees live under `<SWARM_ROOT>/.swarm/worktrees/`; existing legacy sibling
+worktrees remain usable. State is fixed at `<SWARM_ROOT>/.swarm/`.
 `swarm list` selects the current repo; `swarm list --all` and `swarm status` show
 the workspace. Missing registrations produce warnings without blocking healthy
 repos. `status --sizes` scans disk usage; normal status uses cached values only.
+
+Version 1 workspaces require an explicit `swarm migrate` to convert paths and
+submission identities. Do not move existing worktrees or rewrite project-specific
+`swarm.md` instructions as part of normal agent work.
 
 ## Principle
 
@@ -69,8 +74,8 @@ Parallel work occurs in Git worktrees managed by `swarm`.
 One unit of work maps to:
 
 - one branch
-- one worktree (`<repos_dir>/<repo>__<work-id>/`)
-- optionally one **submission marker** (`<state_dir>/submissions/<repo>__<work-id>`)
+- one worktree (`<SWARM_ROOT>/.swarm/worktrees/<repo-path>__<work-id>/`)
+- optionally one **submission marker** (`<SWARM_ROOT>/.swarm/submissions/<repo-path>__<work-id>`)
 
 Worktrees are ephemeral. Branches exist only for the lifetime of active work.
 
@@ -78,17 +83,17 @@ Worktrees are ephemeral. Branches exist only for the lifetime of active work.
 
 Preferred worktree naming:
 
-    <repos_dir>/<repo>__<ticket-id>
+    <SWARM_ROOT>/.swarm/worktrees/<repo-path>__<ticket-id>
 
-Examples (with default `repos_dir: services`):
+Examples (registered repo paths include `services/`):
 
-    services/ts-mono__2680
-    services/gds__2711
+    .swarm/worktrees/services/ts-mono__2680
+    .swarm/worktrees/services/gds__2711
 
 Ticket IDs are strongly preferred but not mandatory. When no ticket exists,
 use a short stable work identifier:
 
-    services/ts-mono__billing-cleanup
+    .swarm/worktrees/services/ts-mono__billing-cleanup
 
 Never create arbitrary alternate worktree directory structures.
 
@@ -108,10 +113,10 @@ remote fetch/rebase/push for you.
 
 Examples:
 
-    swarm create ts-mono 2676
-    swarm create ts-mono 2676 --from origin/fuzzy-search
-    swarm create ts-mono 2676 --track origin/fuzzy-search
-    swarm create ts-mono 2676 task/2676-fuzzy --track origin/fuzzy-search
+    swarm create services/ts-mono 2676
+    swarm create services/ts-mono 2676 --from origin/fuzzy-search
+    swarm create services/ts-mono 2676 --track origin/fuzzy-search
+    swarm create services/ts-mono 2676 task/2676-fuzzy --track origin/fuzzy-search
 
 If the worktree already exists, reuse it. Do not create another branch or
 worktree for the same unit of work.
@@ -154,7 +159,7 @@ When the unit of work is ready for the human integrator:
     swarm submit <repo__work-id>
 
 Requires a clean worktree and clean mergeability vs current canonical trunk.
-This only `touch`es `<state_dir>/submissions/<repo>__<work-id>` (usually
+This only `touch`es `<SWARM_ROOT>/.swarm/submissions/<repo-path>__<work-id>` (usually
 `.swarm/submissions/…`).
 
 Do **not** open a PR as the primary integration path for swarm work unless the
