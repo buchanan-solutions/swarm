@@ -148,6 +148,9 @@ class Workspace(unittest.TestCase):
             self.assertIn(str(wt), output)
             self.assertIn('Local branch (git branch -d; remote branches untouched):\n\ttask/1234', output)
             self.assertIn('All commits preserved by:\n\trefs/heads/main', output)
+            self.assertIn('Submission: present — marker will be removed', output)
+            self.assertIn('This work will leave the submission inbox.', output)
+            self.assertIn(str(marker), output)
             self.assertIn('Preview only', output)
             self.assertTrue(wt.exists())
             self.assertTrue(marker.exists())
@@ -198,6 +201,8 @@ class Workspace(unittest.TestCase):
             (cache / 'data').write_text('cached\n')
         result = self.runcli('remove', 'api', '1234')
         output = result.stdout + result.stderr
+        self.assertIn('None present; no submission will be lost.', output)
+        self.assertNotIn('marker will be removed', output)
         self.assertIn('directories collapsed', output)
         self.assertIn('21 more ignored entries omitted', output)
         self.assertNotIn('node_modules/package/', output)

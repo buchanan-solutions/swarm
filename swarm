@@ -715,8 +715,14 @@ cmd_remove() {
   info "Would remove:"
   info "  Worktree folder (including all contents):"
   info $'\t'"$wt"
-  info "  Submission (if present):"
-  info $'\t'"$SUBMISSIONS_DIR/$id"
+  if is_submitted "$id"; then
+    info "  Submission: present — marker will be removed after successful worktree removal:"
+    info $'\t'"$SUBMISSIONS_DIR/$id"
+    info $'\tThis work will leave the submission inbox. Removing the marker itself does not delete commits.'
+  else
+    info "  Submission:"
+    info $'\tNone present; no submission will be lost.'
+  fi
   if [[ "$delete_branch" -eq 1 ]]; then
     info "  Local branch (git branch -d; remote branches untouched):"
     info $'\t'"$branch"
