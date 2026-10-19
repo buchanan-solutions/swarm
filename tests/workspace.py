@@ -136,6 +136,48 @@ class Workspace(unittest.TestCase):
         self.interactive(['remove', 'api', '1234', '--confirm', '-d'], b'Y\n')
         self.assertFalse(wt.exists())
 
+    def test_integrate_allows_unrelated_untracked_files(self):
+        repo = self.register('api')
+        self.runcli('create', 'api', '1234', '--from', 'HEAD')
+        self.feature(self.wt())
+        self.runcli('submit', 'api', '1234')
+        (repo / 'notes').write_text('leave me alone\n')
+        result = self.runcli('integrate', 'api', '1234', '--dry-run')
+        self.assertIn('actual merge', result.stdout + result.stderr)
+        self.runcli('integrate', 'api', '1234')
+        self.assertEqual((repo / 'notes').read_text(), 'leave me alone\n')
+        self.assertEqual(self.git(repo, 'status', '--porcelain').stdout.strip(), '?? notes')
+        self.assertFalse((self.root / '.swarm/submissions/api___1234').exists())
+
+    def test_integrate_preserves_untracked_collisions_and_submission(self):
+        repo = self.register('api')
+        self.runcli('create', 'api', '1234', '--from', 'HEAD')
+        self.feature(self.wt())
+        self.runcli('submit', 'api', '1234')
+        before = self.git(repo, 'rev-parse', 'HEAD').stdout
+        (repo / 'feature').write_text('local notes\n')
+        result = self.runcli('integrate', 'api', '1234', ok=False)
+        self.assertIn('untracked working tree files', result.stderr)
+        self.assertEqual((repo / 'feature').read_text(), 'local notes\n')
+        self.assertEqual(self.git(repo, 'rev-parse', 'HEAD').stdout, before)
+        self.assertTrue((self.root / '.swarm/submissions/api___1234').exists())
+
+    def test_integrate_blocks_tracked_changes(self):
+        for staged in (False, True):
+            with self.subTest(staged=staged):
+                name = 'api' + str(staged)
+                repo = self.register(name, name)
+                self.runcli('create', name, '1234', '--from', 'HEAD')
+                self.feature(self.wt(name))
+                self.runcli('submit', name, '1234')
+                (repo / 'hello').write_text('local edit\n')
+                if staged:
+                    self.git(repo, 'add', 'hello')
+                result = self.runcli('integrate', name, '1234', ok=False)
+                self.assertIn('canonical trunk has tracked changes', result.stderr)
+                self.assertFalse((repo / 'feature').exists())
+                self.assertTrue((self.root / ('.swarm/submissions/' + name + '___1234')).exists())
+
     def test_create_defaults_to_source_head_and_respects_overrides(self):
         repo = self.register('services/api')
         initial = self.git(repo, 'rev-parse', 'HEAD').stdout.strip()

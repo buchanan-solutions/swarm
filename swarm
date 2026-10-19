@@ -631,9 +631,11 @@ cmd_integrate() {
   dirty="$(working_tree_state "$wt")"
   [[ "$dirty" == "clean" ]] || die "feature worktree is dirty"
 
-  local canon_dirty
-  canon_dirty="$(working_tree_state "$canon")"
-  [[ "$canon_dirty" == "clean" ]] || die "canonical trunk is dirty — commit/stash in $canon first"
+  # Unrelated untracked files are safe: merge checks for paths it would overwrite.
+  # Keep tracked changes out of the integration commit.
+  local canon_status
+  canon_status="$(git -C "$canon" status --porcelain --untracked-files=no)" || die "cannot check canonical trunk status in $canon"
+  [[ -z "$canon_status" ]] || die "canonical trunk has tracked changes — commit/stash in $canon first"
 
   merge="$(mergeability_vs_trunk "$wt" "$canon")"
   [[ "$merge" == "CLEAN" ]] || die "CONFLICT vs current trunk — agent must sync/resubmit"
@@ -645,6 +647,9 @@ cmd_integrate() {
     msg="${_work}: integrate ${branch}"
   fi
 
+  if [[ "$DRY_RUN" == "1" ]]; then
+    info "Untracked-file collisions are checked by Git during the actual merge."
+  fi
   if dry_run_exit "in $canon: git merge --no-ff $branch -m \"$msg\"; clear $SUBMISSIONS_DIR/$id"; then
     return 0
   fi

@@ -189,6 +189,11 @@ swarm integrate ts-mono 1234 -m "1234: integrate feature"
 swarm remove ts-mono 1234 --confirm -d
 ```
 
+Integration requires a clean feature worktree and no staged or unstaged tracked
+changes in the canonical checkout. Unrelated untracked files may remain; Git
+rejects the merge if they would be overwritten. `integrate --dry-run` does not
+check untracked-file collisions. A failed merge keeps the submission for retry.
+
 New branches start at the canonical source checkout's current committed `HEAD`,
 even when you invoke Swarm from another worktree. Uncommitted edits are not copied.
 The default branch name is `task/<work-ID>`; an optional positional branch overrides it.
