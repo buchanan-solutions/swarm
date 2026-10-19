@@ -146,8 +146,8 @@ class Workspace(unittest.TestCase):
             result = self.runcli('remove', 'api', '1234', '-d', *flags)
             output = result.stdout + result.stderr
             self.assertIn(str(wt), output)
-            self.assertIn('local branch: task/1234', output)
-            self.assertIn('All commits preserved by refs/heads/main', output)
+            self.assertIn('Local branch (git branch -d; remote branches untouched):\n\ttask/1234', output)
+            self.assertIn('All commits preserved by:\n\trefs/heads/main', output)
             self.assertIn('Preview only', output)
             self.assertTrue(wt.exists())
             self.assertTrue(marker.exists())
@@ -172,7 +172,7 @@ class Workspace(unittest.TestCase):
         result = self.runcli('remove', 'api', '1234', '-d')
         output = result.stdout + result.stderr
         for text in [' M hello', '?? untracked', 'ignored', 'BLOCKED',
-                     'remote refs; no fetch performed', 'remote ref: 1']:
+                     'remote refs; no fetch performed', 'remote ref:\n\t1']:
             self.assertIn(text, output)
         self.interactive(['remove', 'api', '1234', '--confirm', '-d'], b'Y\n', ok=False)
         self.assertTrue((wt / 'untracked').exists())
@@ -180,9 +180,9 @@ class Workspace(unittest.TestCase):
         self.git(repo, 'update-ref', 'refs/remotes/origin/saved', 'task/1234')
         result = self.runcli('remove', 'api', '1234', '-d')
         output = result.stdout + result.stderr
-        self.assertIn('All commits preserved by refs/heads/backup', output)
-        self.assertIn('All commits preserved by refs/remotes/origin/saved', output)
-        self.assertIn('remote ref: 0', output)
+        self.assertIn('All commits preserved by:\n\trefs/heads/backup', output)
+        self.assertIn('All commits preserved by:\n\trefs/remotes/origin/saved', output)
+        self.assertIn('remote ref:\n\t0', output)
 
     def test_remove_collapses_and_limits_ignored_entries(self):
         self.register('api')
@@ -201,7 +201,7 @@ class Workspace(unittest.TestCase):
         self.assertIn('directories collapsed', output)
         self.assertIn('21 more ignored entries omitted', output)
         self.assertNotIn('node_modules/package/', output)
-        self.assertLess(len(output.splitlines()), 35)
+        self.assertLess(len(output.splitlines()), 45)
         self.assertTrue(dependencies.exists())
 
     def test_remove_reports_unmerged_branch_and_keeps_it(self):

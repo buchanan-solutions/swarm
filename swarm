@@ -711,29 +711,36 @@ cmd_remove() {
 
   branch="$(branch_of "$wt" 2>/dev/null || echo "HEAD")"
 
-  local blocked=0 status ignored refs ref missing remote_refs=0 local_refs=0
+  local blocked=0 status status_entry ignored refs ref missing remote_refs=0 local_refs=0
   info "Would remove:"
-  info "  worktree folder (including all contents): $wt"
-  info "  submission: $SUBMISSIONS_DIR/$id (if present)"
+  info "  Worktree folder (including all contents):"
+  info $'\t'"$wt"
+  info "  Submission (if present):"
+  info $'\t'"$SUBMISSIONS_DIR/$id"
   if [[ "$delete_branch" -eq 1 ]]; then
-    info "  local branch: $branch (git branch -d; remote branches untouched)"
+    info "  Local branch (git branch -d; remote branches untouched):"
+    info $'\t'"$branch"
     if is_protected_branch "$_repo" "$branch"; then
       info "  BLOCKED: '$branch' is a protected/trunk branch"
       blocked=1
     fi
   else
-    info "  branch: $branch (kept; pass -d to request deletion)"
+    info "  Branch (kept; pass -d to request deletion):"
+    info $'\t'"$branch"
   fi
 
   status="$(git -C "$wt" status --porcelain --untracked-files=all)" || die "cannot inspect worktree"
   ignored="$(git -C "$wt" ls-files --others --ignored --exclude-standard --directory --no-empty-directory)" || die "cannot inspect ignored files"
   if [[ -n "$status" ]]; then
     info "  Tracked changes / untracked files (Git status):"
-    info "$status"
+    while IFS= read -r status_entry; do
+      info $'\t'"$status_entry"
+    done <<< "$status"
     info "  BLOCKED: commit/stash changes and move untracked files before removal"
     blocked=1
   else
-    info "  Tracked changes / untracked files: clean"
+    info "  Tracked changes / untracked files:"
+    info $'\tclean'
   fi
   if [[ -n "$ignored" ]]; then
     local ignored_count=0 ignored_entry
@@ -741,14 +748,15 @@ cmd_remove() {
     while IFS= read -r ignored_entry; do
       ignored_count=$((ignored_count + 1))
       if [[ "$ignored_count" -le 10 ]]; then
-        info "    $ignored_entry"
+        info $'\t'"$ignored_entry"
       fi
     done <<< "$ignored"
     if [[ "$ignored_count" -gt 10 ]]; then
-      info "    … $((ignored_count - 10)) more ignored entries omitted"
+      info $'\t'"… $((ignored_count - 10)) more ignored entries omitted"
     fi
   fi
 
+  info ""
   info "  Commit safety (local branches and last-fetched remote refs; no fetch performed):"
   refs="$(git -C "$repo_path" for-each-ref --format='%(refname)' refs/heads refs/remotes)" || die "cannot inspect branch refs"
   local others=()
@@ -756,7 +764,8 @@ cmd_remove() {
     [[ -n "$ref" && "$ref" != "refs/heads/$branch" ]] || continue
     others+=("$ref")
     if git -C "$wt" merge-base --is-ancestor HEAD "$ref"; then
-      info "    All commits preserved by $ref"
+      info "    All commits preserved by:"
+      info $'\t'"$ref"
       case "$ref" in
         refs/remotes/*) remote_refs=$((remote_refs + 1)) ;;
         *) local_refs=$((local_refs + 1)) ;;
@@ -764,7 +773,8 @@ cmd_remove() {
     fi
   done <<< "$refs"
   missing="$(git -C "$wt" rev-list --count HEAD --not "${others[@]}")" || die "cannot check commit reachability"
-  info "    Commits absent from every other local branch / remote ref: $missing"
+  info "    Commits absent from every other local branch / remote ref:"
+  info $'\t'"$missing"
   if [[ "$remote_refs" -eq 0 ]]; then
     info "    No last-fetched remote ref contains all commits."
   fi
@@ -774,19 +784,24 @@ cmd_remove() {
   if [[ "$delete_branch" -eq 1 && "$missing" != 0 ]]; then
     info "  WARNING: branch has commits not preserved on another branch or remote ref."
   fi
+  info ""
   if [[ "$delete_branch" -eq 1 && "$blocked" -eq 0 ]]; then
     local delete_base
     delete_base="$(git -C "$repo_path" rev-parse --verify "$branch@{upstream}" 2>/dev/null || git -C "$repo_path" rev-parse HEAD)" || die "cannot inspect deletion base"
     if git -C "$wt" merge-base --is-ancestor HEAD "$delete_base"; then
-      info "  git branch -d: commits merged into upstream (or canonical HEAD if no upstream)."
+      info "  git branch -d:"
+      info $'\tcommits merged into upstream (or canonical HEAD if no upstream).'
     else
       info "  WARNING: git branch -d would refuse: branch is not merged into upstream (or canonical HEAD if no upstream)."
       info "    Other refs may preserve commits; merge or keep the branch to proceed safely."
     fi
   fi
   info "  Branch deletion remains subject to git branch -d (merged/upstream and worktree checks)."
+  info ""
   if [[ "$confirm" -eq 0 || "$preview" -eq 1 ]]; then
-    info "Preview only; no changes made. Re-run with --confirm (without --dry-run) for an interactive confirmation."
+    info "Preview only; no changes made."
+    info ""
+    info "Re-run with --confirm (without --dry-run) for an interactive confirmation."
     return 0
   fi
   [[ "$blocked" -eq 0 ]] || die "removal blocked; resolve the issues above first"
