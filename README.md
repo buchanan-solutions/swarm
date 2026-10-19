@@ -203,8 +203,19 @@ Branch names may differ from work IDs; worktree identity never depends on the br
 
 `sync` merges the configured integration base into the worktree and clears its
 submission marker. Commit conflicts, test, and submit again. Integration uses
-`--no-ff`, preserving feature ancestry. Removal requires `--confirm` plus typed `Y`;
-optional `-d` uses safe `git branch -d`. Force deletion is not supported.
+`--no-ff`, preserving feature ancestry. `swarm remove ts-mono 1234 -d` previews
+without changing anything; `--dry-run` explicitly requests the same preview, even
+with `--confirm`. The breakdown includes the exact folder, submission marker,
+tracked changes, untracked and ignored files, and the branch to delete or keep.
+Dirty worktrees are blocked; ignored files are reported because removal deletes them.
+Commit safety checks report other local branches and last-fetched remote refs that
+preserve the commits, plus commits unique to the target. No fetch is performed.
+Deletion eligibility follows Git's upstream (or canonical HEAD) merge check;
+commits preserved elsewhere may still require keeping or merging the branch.
+Pass `--confirm` to see the breakdown again and answer `y` or `Y` to
+`Are you sure you want to do this? [y/N]`. Empty input cancels.
+Optional `-d` uses safe `git branch -d`. Force deletion is not supported;
+remote branches are never deleted.
 
 All lifecycle commands accept separate repo/work arguments, `ts-mono___1234`,
 or an absolute managed-checkout path. Inside a registered checkout, omit the repo

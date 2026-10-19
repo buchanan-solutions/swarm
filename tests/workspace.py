@@ -132,9 +132,68 @@ class Workspace(unittest.TestCase):
         self.runcli('integrate', 'api', '1234', '--dry-run')
         self.runcli('integrate', 'api', '1234', '-m', 'Integrate feature')
         self.assertTrue((repo / 'feature').is_file())
-        self.runcli('remove', 'api', '1234', ok=False)
+        self.runcli('remove', 'api', '1234')
         self.interactive(['remove', 'api', '1234', '--confirm', '-d'], b'Y\n')
         self.assertFalse(wt.exists())
+
+    def test_remove_preview_and_confirmation(self):
+        repo = self.register('api')
+        self.runcli('create', 'api', '1234')
+        wt = self.wt()
+        marker = self.root / '.swarm/submissions/api___1234'
+        marker.write_text('test submission\n')
+        for flags in [[], ['--dry-run'], ['--confirm', '--dry-run']]:
+            result = self.runcli('remove', 'api', '1234', '-d', *flags)
+            output = result.stdout + result.stderr
+            self.assertIn(str(wt), output)
+            self.assertIn('local branch: task/1234', output)
+            self.assertIn('All commits preserved by refs/heads/main', output)
+            self.assertIn('Preview only', output)
+            self.assertTrue(wt.exists())
+            self.assertTrue(marker.exists())
+        self.runcli('remove', 'api', '1234', '--confirm', ok=False)
+        self.interactive(['remove', 'api', '1234', '--confirm'], b'\n', ok=False)
+        self.assertTrue(wt.exists())
+        self.assertTrue(marker.exists())
+        self.interactive(['remove', 'api', '1234', '--confirm', '-d'], b'y\n')
+        self.assertFalse(wt.exists())
+        self.assertFalse(marker.exists())
+        self.assertNotIn('task/1234', self.git(repo, 'branch', '--list').stdout)
+
+    def test_remove_reports_files_and_unique_commits(self):
+        repo = self.register('api')
+        self.runcli('create', 'api', '1234')
+        wt = self.wt()
+        self.feature(wt)
+        (wt / 'hello').write_text('dirty\n')
+        (wt / 'untracked').write_text('notes\n')
+        (wt / '.gitignore').write_text('ignored\n')
+        (wt / 'ignored').write_text('also deleted\n')
+        result = self.runcli('remove', 'api', '1234', '-d')
+        output = result.stdout + result.stderr
+        for text in [' M hello', '?? untracked', 'ignored', 'BLOCKED',
+                     'remote refs; no fetch performed', 'remote ref: 1']:
+            self.assertIn(text, output)
+        self.interactive(['remove', 'api', '1234', '--confirm', '-d'], b'Y\n', ok=False)
+        self.assertTrue((wt / 'untracked').exists())
+        self.git(repo, 'branch', 'backup', 'task/1234')
+        self.git(repo, 'update-ref', 'refs/remotes/origin/saved', 'task/1234')
+        result = self.runcli('remove', 'api', '1234', '-d')
+        output = result.stdout + result.stderr
+        self.assertIn('All commits preserved by refs/heads/backup', output)
+        self.assertIn('All commits preserved by refs/remotes/origin/saved', output)
+        self.assertIn('remote ref: 0', output)
+
+    def test_remove_reports_unmerged_branch_and_keeps_it(self):
+        repo = self.register('api')
+        self.runcli('create', 'api', '1234')
+        self.feature(self.wt())
+        result = self.runcli('remove', 'api', '1234', '-d')
+        self.assertIn('git branch -d would refuse', result.stdout + result.stderr)
+        self.git(repo, 'branch', 'backup', 'task/1234')
+        self.interactive(['remove', 'api', '1234', '--confirm', '-d'], b'Y\n', ok=False)
+        self.assertFalse(self.wt().exists())
+        self.assertIn('task/1234', self.git(repo, 'branch', '--list').stdout)
 
     def test_integrate_allows_unrelated_untracked_files(self):
         repo = self.register('api')

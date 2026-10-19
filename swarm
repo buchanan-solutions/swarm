@@ -187,7 +187,8 @@ Agent writes (--dry-run supported):
 
 Human writes:
   swarm integrate [repo-name] <work-ID> [-m "message"] [--dry-run]
-  swarm remove [repo-name] <work-ID> --confirm [-d]
+  swarm remove [repo-name] <work-ID> [--confirm] [-d] [--dry-run]
+    Preview by default; --confirm also requires interactive approval.
 
 Agents MUST NOT run integrate or remove.
 Worktree targets also accept repo-name___work-ID or an absolute managed path.
@@ -683,7 +684,7 @@ is_protected_branch() {
 }
 
 cmd_remove() {
-  local delete_branch=0 confirm=0
+  local delete_branch=0 confirm=0 preview=0
   local targets=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -693,17 +694,14 @@ cmd_remove() {
         die "swarm remove does not support force-delete (-D/--force); use --confirm [-d]"
         ;;
       --dry-run)
-        die "remove does not support --dry-run; use: swarm remove <id> --confirm [-d]"
-        ;;
+        preview=1; shift ;;
       -*) die "unknown flag: $1" ;;
       *) targets+=("$1"); shift ;;
     esac
   done
-  [[ ${#targets[@]} -gt 0 ]] || die "usage: swarm remove [repo-name] <work-id> --confirm [-d]"
-  [[ "$confirm" -eq 1 ]] || die "refusing remove without --confirm
-  usage: swarm remove [repo-name] <work-ID> --confirm [-d]"
+  [[ ${#targets[@]} -gt 0 ]] || die "usage: swarm remove [repo-name] <work-id> [--confirm] [-d] [--dry-run]"
 
-  local id wt canon repo_path branch
+  local id wt repo_path branch
   id="$(resolve_work_target "${targets[@]}")"
   parse_id "$id"
   repo_path="$(canonical_abs "$id")"
@@ -713,31 +711,83 @@ cmd_remove() {
 
   branch="$(branch_of "$wt" 2>/dev/null || echo "HEAD")"
 
-  if [[ "$delete_branch" -eq 1 ]]; then
-    if is_protected_branch "$_repo" "$branch"; then
-      die "refusing -d: '$branch' is a protected/trunk branch
-  remove the worktree without -d, or use a feature branch"
-    fi
-  fi
-
-  info "Will remove:"
-  info "  worktree:   $wt"
+  local blocked=0 status ignored refs ref missing remote_refs=0 local_refs=0
+  info "Would remove:"
+  info "  worktree folder (including all contents): $wt"
   info "  submission: $SUBMISSIONS_DIR/$id (if present)"
   if [[ "$delete_branch" -eq 1 ]]; then
-    info "  branch:     $branch  (git branch -d after worktree remove)"
+    info "  local branch: $branch (git branch -d; remote branches untouched)"
+    if is_protected_branch "$_repo" "$branch"; then
+      info "  BLOCKED: '$branch' is a protected/trunk branch"
+      blocked=1
+    fi
   else
-    info "  branch:     $branch  (kept; pass -d to delete if merged)"
+    info "  branch: $branch (kept; pass -d to request deletion)"
   fi
-  info ""
-  printf 'Type Y to confirm removal: ' >&2
+
+  status="$(git -C "$wt" status --porcelain --untracked-files=all)" || die "cannot inspect worktree"
+  ignored="$(git -C "$wt" ls-files --others --ignored --exclude-standard)" || die "cannot inspect ignored files"
+  if [[ -n "$status" ]]; then
+    info "  Tracked changes / untracked files (Git status):"
+    info "$status"
+    info "  BLOCKED: commit/stash changes and move untracked files before removal"
+    blocked=1
+  else
+    info "  Tracked changes / untracked files: clean"
+  fi
+  if [[ -n "$ignored" ]]; then
+    info "  Ignored files (will also be deleted):"
+    info "$ignored"
+  fi
+
+  info "  Commit safety (local branches and last-fetched remote refs; no fetch performed):"
+  refs="$(git -C "$repo_path" for-each-ref --format='%(refname)' refs/heads refs/remotes)" || die "cannot inspect branch refs"
+  local others=()
+  while IFS= read -r ref; do
+    [[ -n "$ref" && "$ref" != "refs/heads/$branch" ]] || continue
+    others+=("$ref")
+    if git -C "$wt" merge-base --is-ancestor HEAD "$ref"; then
+      info "    All commits preserved by $ref"
+      case "$ref" in
+        refs/remotes/*) remote_refs=$((remote_refs + 1)) ;;
+        *) local_refs=$((local_refs + 1)) ;;
+      esac
+    fi
+  done <<< "$refs"
+  missing="$(git -C "$wt" rev-list --count HEAD --not "${others[@]}")" || die "cannot check commit reachability"
+  info "    Commits absent from every other local branch / remote ref: $missing"
+  if [[ "$remote_refs" -eq 0 ]]; then
+    info "    No last-fetched remote ref contains all commits."
+  fi
+  if [[ "$local_refs" -eq 0 && "$remote_refs" -eq 0 && "$missing" == 0 ]]; then
+    info "    Commits are preserved across other refs, but no single ref contains the tip."
+  fi
+  if [[ "$delete_branch" -eq 1 && "$missing" != 0 ]]; then
+    info "  WARNING: branch has commits not preserved on another branch or remote ref."
+  fi
+  if [[ "$delete_branch" -eq 1 && "$blocked" -eq 0 ]]; then
+    local delete_base
+    delete_base="$(git -C "$repo_path" rev-parse --verify "$branch@{upstream}" 2>/dev/null || git -C "$repo_path" rev-parse HEAD)" || die "cannot inspect deletion base"
+    if git -C "$wt" merge-base --is-ancestor HEAD "$delete_base"; then
+      info "  git branch -d: commits merged into upstream (or canonical HEAD if no upstream)."
+    else
+      info "  WARNING: git branch -d would refuse: branch is not merged into upstream (or canonical HEAD if no upstream)."
+      info "    Other refs may preserve commits; merge or keep the branch to proceed safely."
+    fi
+  fi
+  info "  Branch deletion remains subject to git branch -d (merged/upstream and worktree checks)."
+  if [[ "$confirm" -eq 0 || "$preview" -eq 1 ]]; then
+    info "Preview only; no changes made. Re-run with --confirm (without --dry-run) for an interactive confirmation."
+    return 0
+  fi
+  [[ "$blocked" -eq 0 ]] || die "removal blocked; resolve the issues above first"
+  printf 'Are you sure you want to do this? [y/N] ' >&2
   local answer=""
   if [[ ! -t 0 ]]; then
     die "remove requires an interactive terminal to confirm (stdin is not a TTY)"
   fi
   read -r answer
-  [[ "$answer" == "Y" ]] || die "aborted (expected exactly Y)"
-
-  clear_submission "$id"
+  [[ "$answer" == "Y" || "$answer" == "y" ]] || die "aborted"
 
   info "removing worktree $wt"
   if ! git -C "$repo_path" worktree remove "$wt"; then
@@ -745,6 +795,7 @@ cmd_remove() {
   branch left intact: $branch"
   fi
 
+  clear_submission "$id"
   git -C "$repo_path" worktree prune
 
   if [[ "$delete_branch" -eq 1 ]]; then
