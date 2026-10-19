@@ -184,6 +184,26 @@ class Workspace(unittest.TestCase):
         self.assertIn('All commits preserved by refs/remotes/origin/saved', output)
         self.assertIn('remote ref: 0', output)
 
+    def test_remove_collapses_and_limits_ignored_entries(self):
+        self.register('api')
+        self.runcli('create', 'api', '1234')
+        wt = self.wt()
+        (wt / '.gitignore').write_text('node_modules/\ncache-*/\n')
+        dependencies = wt / 'node_modules' / 'package'
+        dependencies.mkdir(parents=True)
+        for index in range(30):
+            (dependencies / str(index)).write_text('dependency\n')
+            cache = wt / ('cache-%02d' % index)
+            cache.mkdir()
+            (cache / 'data').write_text('cached\n')
+        result = self.runcli('remove', 'api', '1234')
+        output = result.stdout + result.stderr
+        self.assertIn('directories collapsed', output)
+        self.assertIn('21 more ignored entries omitted', output)
+        self.assertNotIn('node_modules/package/', output)
+        self.assertLess(len(output.splitlines()), 35)
+        self.assertTrue(dependencies.exists())
+
     def test_remove_reports_unmerged_branch_and_keeps_it(self):
         repo = self.register('api')
         self.runcli('create', 'api', '1234')

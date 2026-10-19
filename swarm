@@ -726,7 +726,7 @@ cmd_remove() {
   fi
 
   status="$(git -C "$wt" status --porcelain --untracked-files=all)" || die "cannot inspect worktree"
-  ignored="$(git -C "$wt" ls-files --others --ignored --exclude-standard)" || die "cannot inspect ignored files"
+  ignored="$(git -C "$wt" ls-files --others --ignored --exclude-standard --directory --no-empty-directory)" || die "cannot inspect ignored files"
   if [[ -n "$status" ]]; then
     info "  Tracked changes / untracked files (Git status):"
     info "$status"
@@ -736,8 +736,17 @@ cmd_remove() {
     info "  Tracked changes / untracked files: clean"
   fi
   if [[ -n "$ignored" ]]; then
-    info "  Ignored files (will also be deleted):"
-    info "$ignored"
+    local ignored_count=0 ignored_entry
+    info "  Ignored files/directories (will also be deleted; directories collapsed):"
+    while IFS= read -r ignored_entry; do
+      ignored_count=$((ignored_count + 1))
+      if [[ "$ignored_count" -le 10 ]]; then
+        info "    $ignored_entry"
+      fi
+    done <<< "$ignored"
+    if [[ "$ignored_count" -gt 10 ]]; then
+      info "    … $((ignored_count - 10)) more ignored entries omitted"
+    fi
   fi
 
   info "  Commit safety (local branches and last-fetched remote refs; no fetch performed):"
