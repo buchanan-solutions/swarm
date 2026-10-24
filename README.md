@@ -138,7 +138,10 @@ or configure `default_ide`. Unsupported defaults, multiple launcher flags, and
 missing executables are errors. There is no fallback launcher or VS Code support.
 Opening does not install skills, alter permissions, or start background agents.
 
-`path` emits only an absolute path to stdout, so it composes with shell commands.
+On success, `path` emits only an absolute path to stdout, so it composes with shell commands.
+On failure, it prints `.` and exits nonzero, keeping `cd $(swarm path …)` in the
+current directory. Errors go to stderr. Quote the substitution to support spaces:
+`cd "$(swarm path ts-mono 1234)"`.
 Warnings go to stderr. `path` alone returns the inferred canonical repo; supplying
 a work ID selects its existing worktree. It never creates checkouts.
 

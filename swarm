@@ -1368,6 +1368,12 @@ main() {
   local cmd="${1:-help}"
   shift || true
 
+  # An empty command substitution turns `cd $(swarm path ...)` into bare cd.
+  # Cover configuration failures as well as lookup failures, preserving status.
+  if [[ "$cmd" == path ]]; then
+    trap 'status=$?; if (( status != 0 )); then printf ".\n"; fi; exit "$status"' EXIT
+  fi
+
   case "$cmd" in
     help|-h|--help)
       usage

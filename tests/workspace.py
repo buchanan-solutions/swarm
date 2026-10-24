@@ -297,6 +297,22 @@ class Workspace(unittest.TestCase):
         self.runcli('create', 'api', 'detached-source')
         self.assertEqual(self.git(self.wt('api', 'detached-source'), 'rev-parse', 'HEAD').stdout.strip(), source_head)
 
+    def test_failed_path_keeps_cd_in_current_directory(self):
+        repo = self.register('folder with spaces/api')
+        for args, cwd in [(('api', 'missing'), repo),
+                          (('unknown',), repo),
+                          (('api',), pathlib.Path(self.tmp.name).parent)]:
+            with self.subTest(args=args, cwd=cwd):
+                result = self.runcli('path', *args, cwd=cwd, ok=False)
+                self.assertEqual(result.stdout, '.\n')
+                self.assertIn('error:', result.stderr)
+                for substitution in ['$("$@")', '"$("$@")"']:
+                    result = self.cmd(['bash', '-c',
+                                       'cd ' + substitution + '; pwd -P',
+                                       'test', CLI, 'path', *args], cwd=cwd)
+                    self.assertEqual(result.stdout, str(cwd.resolve()) + '\n')
+                    self.assertIn('error:', result.stderr)
+
     def test_paths_inference_listing_and_external_health(self):
         repo = self.register('deep folder/api')
         self.register('other/api', 'secondary')
