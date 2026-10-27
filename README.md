@@ -201,6 +201,22 @@ New branches start at the canonical source checkout's current committed `HEAD`,
 even when you invoke Swarm from another worktree. Uncommitted edits are not copied.
 The default branch name is `task/<work-ID>`; an optional positional branch overrides it.
 `--from` overrides the starting ref. `--track` additionally sets the branch upstream.
+Use repeated `--with-env` options to copy local `.env` files from directories in
+that source checkout, preserving their relative paths:
+
+```sh
+swarm create ts-mono 2850-quoting-fixes codex/2850-quoting-fixes \
+  --from 2850-quoting --with-env apps --with-env services
+```
+
+Each directory is relative to the source repo; `--with-env .` searches the whole
+repo. Discovery stops below each directory containing a regular `.env`, while
+continuing through sibling directories. Symlinks, Git metadata, and dependency
+folders (`node_modules`, `bower_components`, `vendor`, `.venv`, `venv`, and
+`__pycache__`) are skipped. Absolute paths, parent traversal, and symlinked input
+paths are rejected. Existing destination files and symlinked destination paths
+are skipped. `--dry-run` lists planned copies without reading file contents.
+
 Repeat creation to reuse an existing worktree for the same repo and work ID.
 Branch names may differ from work IDs; worktree identity never depends on the branch.
 

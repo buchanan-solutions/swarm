@@ -63,6 +63,58 @@ class Workspace(unittest.TestCase):
         self.git(wt, 'add', '.')
         self.git(wt, 'commit', '-m', 'feature')
 
+    def test_create_with_env_traversal_and_dry_run(self):
+        repo = self.register('api')
+        files = ['apps/one/.env', 'apps/one/nested/.env', 'apps/two/deep/.env',
+                 'services/.env', 'services/nested/.env', 'node_modules/pkg/.env',
+                 '.git/private/.env', '.venv/pkg/.env', 'apps/space name/.env']
+        for name in files:
+            path = repo / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('SECRET_VALUE=private\n')
+        (repo / 'apps/link').symlink_to(repo / 'services', target_is_directory=True)
+        (repo / 'apps/linked-file').mkdir()
+        (repo / 'apps/linked-file/.env').symlink_to(repo / 'services/.env')
+        args = ('create', 'api', '1234', '--with-env', 'apps', '--with-env=services',
+                '--with-env', 'apps')
+        dry = self.runcli(*args, '--dry-run')
+        self.assertIn('apps/one/.env', dry.stdout)
+        self.assertNotIn('SECRET_VALUE', dry.stdout + dry.stderr)
+        self.assertFalse(self.wt().exists())
+        self.runcli(*args)
+        for name in ['apps/one/.env', 'apps/two/deep/.env', 'services/.env',
+                     'apps/space name/.env']:
+            self.assertEqual((self.wt() / name).read_text(), 'SECRET_VALUE=private\n')
+        for name in ['apps/one/nested/.env', 'services/nested/.env',
+                     'apps/link/.env', 'apps/linked-file/.env']:
+            self.assertFalse((self.wt() / name).exists())
+        (self.wt() / 'services/.env').write_text('keep\n')
+        self.runcli(*args)
+        self.assertEqual((self.wt() / 'services/.env').read_text(), 'keep\n')
+        self.runcli('create', 'api', 'all', '--with-env', '.')
+        for name in ['node_modules/pkg/.env', '.git/private/.env', '.venv/pkg/.env']:
+            self.assertFalse((self.wt(work='all') / name).exists())
+        (repo / '.env').write_text('root\n')
+        self.runcli('create', 'api', 'root', '--with-env', '.')
+        self.assertEqual((self.wt(work='root') / '.env').read_text(), 'root\n')
+        self.assertFalse((self.wt(work='root') / 'apps/one/.env').exists())
+
+    def test_create_with_env_rejects_paths_and_skips_destination_symlinks(self):
+        repo = self.register('api')
+        (repo / 'apps').mkdir()
+        (repo / 'apps/.env').write_text('private\n')
+        (repo / 'linked').symlink_to(repo / 'apps', target_is_directory=True)
+        for bad in ['../api', str(repo), 'linked', 'linked/../apps', 'missing', '.git']:
+            self.runcli('create', 'api', 'invalid', '--with-env', bad, ok=False)
+            self.assertFalse(self.wt(work='invalid').exists())
+        self.runcli('create', 'api', 'invalid', '--with-env', ok=False)
+        self.runcli('create', 'api', '1234')
+        outside = self.root / 'outside'
+        outside.mkdir()
+        (self.wt() / 'apps').symlink_to(outside, target_is_directory=True)
+        self.runcli('create', 'api', '1234', '--with-env', 'apps')
+        self.assertFalse((outside / '.env').exists())
+
     def test_init_and_registration(self):
         self.assertEqual(self.config(), {'version': 2, 'default_ide': '', 'repos': {}})
         self.assertNotIn('*__*/', (self.root / '.gitignore').read_text())

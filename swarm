@@ -181,7 +181,7 @@ Inspect and navigate:
   swarm review [repo-name] <work-ID>
 
 Agent writes (--dry-run supported):
-  swarm create [repo-name] <work-ID> [branch] [--from <ref>] [--track <remote-branch>]
+  swarm create [repo-name] <work-ID> [branch] [--from <ref>] [--track <remote-branch>] [--with-env <directory>]...
   swarm sync [repo-name] <work-ID>
   swarm submit [repo-name] <work-ID>
 
@@ -325,13 +325,52 @@ EOF
   fi
 }
 
+# Collect .env paths, stopping only the subtree containing a regular .env.
+collect_env_files() {
+  local dir="$1" child name
+  if [[ -f "$dir/.env" && ! -L "$dir/.env" ]]; then
+    env_files+=("${dir#"$env_source"/}/.env")
+    [[ "$dir" != "$env_source" ]] || env_files[${#env_files[@]}-1]=".env"
+    return
+  fi
+  while IFS= read -r -d '' child; do
+    name="${child##*/}"
+    case "$name" in
+      .git|node_modules|bower_components|vendor|.venv|venv|__pycache__) continue ;;
+    esac
+    collect_env_files "$child"
+  done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d ! -type l -print0 | sort -z)
+}
+
+# Reject symlinked destination parents before creating directories or copying.
+env_destination_safe() {
+  local path="$1" part current="$wt_path"
+  local parts=()
+  IFS='/' read -r -a parts <<< "$path"
+  [[ ! -L "$current" ]] || return 1
+  for part in "${parts[@]}"; do
+    current="$current/$part"
+    [[ ! -L "$current" ]] || return 1
+  done
+}
+
 cmd_create() {
   require_wp
   local repo="" work_id="" branch="" from_ref="" track_ref=""
-  local positional=()
-  local usage_create='usage: swarm create <repo> <work-id> [branch] [--from <ref>] [--track <remote-branch>] [--dry-run]'
+  local positional=() env_dirs=() env_files=()
+  local usage_create='usage: swarm create <repo> <work-id> [branch] [--from <ref>] [--track <remote-branch>] [--with-env <directory>]... [--dry-run]'
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --with-env)
+        [[ -n "${2:-}" && "$2" != -* ]] || die "--with-env requires a directory"
+        env_dirs+=("$2")
+        shift 2
+        ;;
+      --with-env=*)
+        [[ -n "${1#--with-env=}" ]] || die "--with-env requires a directory"
+        env_dirs+=("${1#--with-env=}")
+        shift
+        ;;
       --from)
         [[ -n "${2:-}" ]] || die "--from requires a ref
 $usage_create"
@@ -398,6 +437,36 @@ or:  swarm create $repo $work_id task/${work_id} --track $branch"
   if [[ ! -d "$wt_path" ]] && git -C "$(repo_abs "$repo")" worktree list --porcelain | grep -Fx "worktree $wt_path" >/dev/null; then
     die "worktree metadata exists but checkout is missing: $wt_path; inspect swarm status"
   fi
+  local env_source env_dir component current rel
+  env_source="$(repo_abs "$repo")"
+  for env_dir in "${env_dirs[@]}"; do
+    [[ "$env_dir" != /* ]] || die "--with-env must be relative to the source repo: $env_dir"
+    current="$env_source"
+    local components=()
+    IFS='/' read -r -a components <<< "$env_dir"
+    for component in "${components[@]}"; do
+      case "$component" in
+        ..) die "--with-env must not escape the repo: $env_dir" ;;
+        .|"") continue ;;
+        .git|node_modules|bower_components|vendor|.venv|venv|__pycache__)
+          die "--with-env excludes dependency and metadata directories: $env_dir" ;;
+      esac
+      current="$current/$component"
+      [[ ! -L "$current" ]] || die "--with-env must not traverse symlinks: $env_dir"
+    done
+    [[ -d "$current" ]] || die "--with-env directory does not exist: $env_dir"
+    collect_env_files "$current"
+  done
+  # Overlapping directory arguments must not copy the same file twice.
+  local unique_env_files=() candidate seen
+  for rel in "${env_files[@]}"; do
+    seen=0
+    for candidate in "${unique_env_files[@]}"; do
+      [[ "$candidate" != "$rel" ]] || seen=1
+    done
+    [[ "$seen" == 1 ]] || unique_env_files+=("$rel")
+  done
+  env_files=("${unique_env_files[@]}")
   local plan="create worktree $wt_path on branch $branch"
   if [[ -n "$from_ref" ]]; then
     plan="$plan from $from_ref"
@@ -412,6 +481,15 @@ or:  swarm create $repo $work_id task/${work_id} --track $branch"
     plan="$plan tracking $track_ref"
   fi
   plan="$plan (via wp create)"
+  if [[ "$DRY_RUN" == 1 ]]; then
+    for rel in "${env_files[@]}"; do
+      if ! env_destination_safe "$rel" || [[ -e "$wt_path/$rel" ]]; then
+        info "skip existing or symlinked env destination: $wt_path/$rel"
+      else
+        info "copy env: $env_source/$rel -> $wt_path/$rel"
+      fi
+    done
+  fi
   if dry_run_exit "$plan"; then
     return 0
   fi
@@ -420,6 +498,15 @@ or:  swarm create $repo $work_id task/${work_id} --track $branch"
   [[ -n "$from_ref" ]] && wp_args+=(--from "$from_ref")
   [[ -n "$track_ref" ]] && wp_args+=(--track "$track_ref")
   WP_TARGET_WORKTREE="$wt_path" "$WP" create "${wp_args[@]}"
+  for rel in "${env_files[@]}"; do
+    if ! env_destination_safe "$rel" || [[ -e "$wt_path/$rel" ]]; then
+      info "skip existing or symlinked env destination: $wt_path/$rel"
+      continue
+    fi
+    mkdir -p "$(dirname "$wt_path/$rel")"
+    cp -n -- "$env_source/$rel" "$wt_path/$rel"
+    info "copied env: $rel"
+  done
 }
 
 cmd_sync() {
