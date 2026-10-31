@@ -217,12 +217,32 @@ After submit, stop modifying that worktree unless asked to sync/fix conflicts.
 ```text
 swarm integrate …
 swarm remove …
+sudo swarm access …
 ```
 
 Only the human trunk manager integrates into the canonical checkout and removes
 worktrees/branches. `integrate` uses `git merge --no-ff` (ancestry preserved).
 `remove` requires `--confirm` and an interactive `Y`; optional `-d` runs
 `git branch -d` only (never `-D` / `--force`).
+
+### Human administrator: allocate collaborator access (Linux)
+
+After normal-user `swarm create`, an administrator can run
+`swarm access <repo> <work-id> -u <existing-user> --dry-run`, then apply with sudo.
+`-u` aliases `--owner`: checkout ownership transfers and the user joins the default
+`swarm-<repo>-<work-id>` group. `--group` overrides it; reuse needs confirmation or
+`--yes`. Unknown users fail before changes. Without `--owner`, only group access
+is prepared and existing ownership is retained.
+
+This grants parent navigation/listing, inherited checkout ACLs and repository-wide
+shared Git ACLs while preserving shared Git ownership and other collaborators'
+effective access. The exact checkout is added to the owner's Git trust configuration.
+The user must log in again and run installs under their own account. It does not
+fix external private Python interpreters/caches or supply push credentials.
+Stop writers during allocation. Hard links, nested repositories, external Git
+objects, mounts and symlinked scope require manual review. Partial failures are
+reported and rerunnable. Agents must not apply access without explicit human
+authorization; previewing with `--dry-run` is read-only.
 
 ## Completion lifecycle
 

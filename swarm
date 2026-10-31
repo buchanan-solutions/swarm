@@ -186,6 +186,7 @@ Agent writes (--dry-run supported):
   swarm submit [repo-name] <work-ID>
 
 Human writes:
+  sudo swarm access <repo-name> <work-ID> [-u USER] [--group GROUP] [--dry-run] [--yes]
   swarm integrate [repo-name] <work-ID> [-m "message"] [--dry-run]
   swarm remove [repo-name] <work-ID> [--confirm] [-d] [--dry-run]
     Preview by default; --confirm also requires interactive approval.
@@ -1454,6 +1455,13 @@ $install_usage"
 main() {
   local cmd="${1:-help}"
   shift || true
+
+  # Access owns its read-only discovery and narrow elevated mutation path.
+  # Do not load workspace state or run repository Git commands as root here.
+  if [[ "$cmd" == access ]]; then
+    [[ -x /usr/bin/python3 ]] || die "swarm access requires Python 3"
+    exec /usr/bin/python3 -I "$CLI_DIR/lib/access.py" "$@"
+  fi
 
   # An empty command substitution turns `cd $(swarm path ...)` into bare cd.
   # Cover configuration failures as well as lookup failures, preserving status.

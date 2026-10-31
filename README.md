@@ -197,6 +197,56 @@ changes in the canonical checkout. Unrelated untracked files may remain; Git
 rejects the merge if they would be overwritten. `integrate --dry-run` does not
 check untracked-file collisions. A failed merge keeps the submission for retry.
 
+### Allocate a worktree to another Linux user
+
+Create the worktree as your normal administrator account, then allocate it before
+the collaborator installs dependencies:
+
+```bash
+swarm create api feature --from HEAD
+swarm access api feature -u alia --dry-run
+sudo /absolute/path/to/swarm access api feature -u alia
+```
+
+`access` requires Python 3, Linux POSIX ACL support (`acl`/`libacl`), Git, and the
+standard `groupadd`/`usermod` tools. Run it from the owning workspace with explicit
+repo and work IDs (or `repo___work`). Use the absolute executable path when sudo's
+PATH does not include Swarm. It operates on an existing registered worktree only.
+Applying it requires sudo from the account that owns the workspace and canonical
+checkout. Use a trusted Swarm installation and stop writers while allocating.
+
+`-u` / `--owner` must name an existing non-root user with a usable home directory.
+An unknown user fails before any changes. The command creates the default group
+`swarm-<repo>-<work-id>` (override with `--group`), adds the user to it, transfers
+checkout ownership, and sets inherited group permissions. Omit `--owner` to retain
+existing owners and prepare group access without adding members. Existing group
+reuse requires confirmation, or `--yes`; `--dry-run` never changes anything.
+
+Necessary workspace parents receive group read/traverse access for navigation and
+listing. Ancestors above the workspace receive traversal only when needed; parent
+directories never receive group write or new default ACLs. Existing effective ACL
+rights are preserved, including administrator access. Listing reveals sibling names.
+The shared Git directory receives additive inherited ACLs, preserving its ownership,
+so collaborators can commit. This grants repository-wide Git access, including
+other branches and worktree metadata; it is intended for trusted collaborators.
+
+With `--owner`, Swarm checks file operations and Git access as that user and adds
+only the exact checkout to their `~/.gitconfig` safe-directory list. It never runs
+project hooks, installs, or development commands as root. Log out and back in as
+the collaborator, then run `pnpm install`, `uv sync`, etc. under their account.
+Their Git identity, signing keys and push credentials remain their responsibility.
+
+Symlinks inside the checkout are skipped; symlinked path components or Git metadata,
+hard-linked files, nested repositories, mount crossings and Git object alternates
+require manual review. Recreate hard-linked dependencies as the intended owner.
+External private Python interpreters/caches need separate setup; owning a `.venv`
+does not grant access to an interpreter under another user's private home.
+Programs that explicitly chmod files can restrict inherited ACLs again.
+
+Permission changes are not atomic. Failures report the stage and completed steps;
+correct the problem and rerun. Access allocation does not implement revocation or
+delete users/groups. `swarm access --help` lists membership-management commands.
+
 New branches start at the canonical source checkout's current committed `HEAD`,
 even when you invoke Swarm from another worktree. Uncommitted edits are not copied.
 The default branch name is `task/<work-ID>`; an optional positional branch overrides it.

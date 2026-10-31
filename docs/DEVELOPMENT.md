@@ -138,6 +138,7 @@ Use an explicit target path and `--yes` when testing intentional parent duplicat
 ```bash
 bash -n swarm wp lib/*.sh
 python3 tests/workspace.py -v
+python3 tests/access.py -v
 git diff --check
 ```
 
@@ -175,3 +176,27 @@ normal commands reject those shapes. No version 3 is introduced.
 The release checks are Bash syntax, all integration tests, and `git diff --check`.
 Keep help, README, installation docs, and the shared agent skill consistent. Project
 `swarm.md` and customized installed skills must not be overwritten by upgrades.
+
+## Linux access allocation testing
+
+`tests/access.py` uses disposable files under `/tmp/swarm` and exercises actual ACL
+inheritance without creating accounts or applying elevated allocation. A sandbox
+with only one mapped GID skips the real second-group check; it needs host testing.
+
+For the privileged acceptance test, have the administrator create a disposable
+account first (never use a real collaborator account):
+
+```bash
+sudo useradd --create-home --user-group --shell /bin/bash swarm-access-test
+sudo python3 tests/access_privileged.py --owner swarm-access-test
+```
+
+The test refuses root/the administrator as target and requires a name beginning
+with `swarm-access-test`. It creates a workspace and dedicated group under a random
+`/tmp/swarm/host-access-*` directory, exercises actual ownership, ACLs, user/admin
+commits, confirmation and retries, and checks system-ancestor ACLs were unchanged.
+It never creates users or touches real project checkouts. Its installer check
+emulates dependency directories, chmod and rename without downloading packages.
+It retains its workspace for inspection and prints exact directory/group cleanup
+commands and `sudo userdel --remove swarm-access-test` after testing. The disposable
+user's Git configuration and group membership are intentionally changed.
